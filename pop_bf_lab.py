@@ -2227,6 +2227,7 @@ class JadeToolkit(tk.Tk):
         file_menu.add_command(label="Import .BIN...", command=self.import_bin)
         file_menu.add_separator()
         file_menu.add_command(label="Extract selected asset...", command=self.extract_selected)
+        file_menu.add_command(label="Extract all assets", command=self.extract_all_assets)
         file_menu.add_command(label="Save edited .BIN as...", command=self.save_bin)
         file_menu.add_command(label="Rebuild .BF as...", command=self.rebuild_bf)
         file_menu.add_separator()
@@ -3154,6 +3155,48 @@ class JadeToolkit(tk.Tk):
             self._log(f"ERROR Extract: {exc}")
             messagebox.showerror("Extract", str(exc))
 
+    def extract_all_assets(self) -> None:
+        if self.project.kind != "bf" or self.project.path is None:
+            messagebox.showinfo("Extract all assets", "Apri prima un file .BF.")
+            return
+
+        source = self.project.path
+        target_dir = source.parent / f"{source.stem}_extracted"
+
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            used_names: set[str] = set()
+            extracted = 0
+
+            self._log(f"INFO  Estrazione completa BF: {source.name} -> {target_dir}")
+            for asset in self.project.assets:
+                name = Path(asset.name).name.strip()
+                if not name or name in (".", ".."):
+                    name = f"file_{asset.index:06d}"
+
+                for char in '<>:"/\\|?*':
+                    name = name.replace(char, "_")
+                name = name.rstrip(" .") or f"file_{asset.index:06d}"
+
+                candidate = name
+                if candidate.casefold() in used_names:
+                    stem = Path(name).stem
+                    suffix = Path(name).suffix
+                    candidate = f"{stem}_{asset.index:06d}{suffix}"
+                used_names.add(candidate.casefold())
+
+                data = self.project.read_asset(asset)
+                (target_dir / candidate).write_bytes(data)
+                extracted += 1
+
+            self._log(f"OK    Estratti {extracted:,} asset -> {target_dir}")
+            messagebox.showinfo(
+                "Extract all assets",
+                f"Estratti {extracted:,} asset in:\n{target_dir}",
+            )
+        except Exception as exc:
+            self._log(f"ERROR Extract all: {exc}")
+            messagebox.showerror("Extract all assets", str(exc))
     def rebuild_bf(self) -> None:
         if self.project.kind != "bf":
             messagebox.showinfo("Rebuild BF", "Apri un .bf e seleziona un asset da modificare.")
