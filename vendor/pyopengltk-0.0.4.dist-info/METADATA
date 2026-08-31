@@ -1,0 +1,116 @@
+Metadata-Version: 2.1
+Name: pyopengltk
+Version: 0.0.4
+Summary: An opengl frame for pyopengl-tkinter based on ctype
+Home-page: http://github.com/jonwright/pyopengltk
+Author: Jon Wright
+Author-email: jonathan.wright@gmail.com
+License: MIT
+Keywords: opengl,window,context,tk,tkinter
+Platform: UNKNOWN
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Environment :: Win32 (MS Windows)
+Classifier: Environment :: X11 Applications
+Classifier: Intended Audience :: Developers
+Classifier: Topic :: Multimedia :: Graphics
+Classifier: Topic :: Multimedia :: Graphics :: 3D Rendering
+Classifier: Topic :: Scientific/Engineering :: Visualization
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Classifier: Programming Language :: Python :: 2
+Classifier: Programming Language :: Python :: 2.7
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.5
+Classifier: Programming Language :: Python :: 3.6
+Classifier: Programming Language :: Python :: 3.7
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: pyopengl
+
+# pyopengltk
+
+Tkinter - OpenGL Frame using ctypes
+
+* [pyopengltk on Github](https://github.com/jonwright/pyopengltk)
+* [pyopengltk on PyPI](https://pypi.org/project/pyopengltk/)
+
+An opengl frame for pyopengl-tkinter based on ctypes (no togl compilation)
+
+Collected together by Jon Wright, Jan 2018.
+
+## Basic Example
+
+This example creates a window containing an `OpenGLFrame`
+filling the entire window. We configure it to animate
+(constantly redraw) clearing the screen using a green color.
+A simple framerate counter is included.
+The context information is printed to the terminal.
+
+```python
+import time
+import tkinter
+from OpenGL import GL
+from pyopengltk import OpenGLFrame
+
+class AppOgl(OpenGLFrame):
+
+    def initgl(self):
+        """Initalize gl states when the frame is created"""
+        GL.glViewport(0, 0, self.width, self.height)
+        GL.glClearColor(0.0, 1.0, 0.0, 0.0)    
+        self.start = time.time()
+        self.nframes = 0
+
+    def redraw(self):
+        """Render a single frame"""
+        GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+        tm = time.time() - self.start
+        self.nframes += 1
+        print("fps",self.nframes / tm, end="\r" )
+
+
+if __name__ == '__main__':
+    root = tkinter.Tk()
+    app = AppOgl(root, width=320, height=200)
+    app.pack(fill=tkinter.BOTH, expand=tkinter.YES)
+    app.animate = 1
+    app.after(100, app.printContext)
+    app.mainloop()
+```
+
+The repository on Github also contains more examples.
+
+## Install
+
+From PyPI:
+
+```
+pip install pyopengltk
+```
+
+From source:
+
+```
+git clone https://github.com/jonwright/pyopengltk
+cd pyopengltk
+pip install .
+```
+
+## Attributions
+
+Based on the work of others.
+
+### C + Tcl/Tk example:
+
+* Project URL : http://github.com/codeplea/opengl-tcltk/ (zlib license)
+* Article at : https://codeplea.com/opengl-with-c-and-tcl-tk
+
+### Python + Tkinter (no pyopengl) example:
+
+* Project URL : http://github.com/arcanosam/pytkogl/ (The Code Project Open License)
+* Article at: http://www.codeproject.com/Articles/1073475/OpenGL-in-Python-with-TKinter
+
+### pyopengl
+
+* Large regions of code copied from `pyopengl/Tk/__init__.py`.
+
+
