@@ -2323,6 +2323,7 @@ class JadeToolkit(tk.Tk):
         self._material_shape = tk.StringVar(value="sphere")
         self._material_dirty = False
         self._material_preview_photo = None
+        self._bf_repack_info = None
         self._mesh_drag = None
         self._mesh_yaw = -0.45
         self._mesh_pitch = 0.18
@@ -2426,7 +2427,7 @@ class JadeToolkit(tk.Tk):
 
         help_menu = tk.Menu(menu, tearoff=False, bg=palette["surface"], fg=palette["fg"],
                             activebackground=palette["select"], activeforeground=palette["fg"], borderwidth=0)
-        help_menu.add_command(label="About Jade Toolkit", command=self.about)
+        help_menu.add_command(label="About POP BF Lab", command=self.about)
         menu.add_cascade(label="Help", menu=help_menu)
         self.config(menu=menu)
 
@@ -2462,26 +2463,25 @@ class JadeToolkit(tk.Tk):
         self.material_tab = ttk.Frame(self.tabs, padding=8)
         self.bf_repack_tab = ttk.Frame(self.tabs, padding=8)
         self.tabs.add(self.asset_tab, text="Asset Browser")
+        self.tabs.add(self.bf_repack_tab, text="BF Repack")
         self.tabs.add(self.ova_tab, text="OVA Variables")
         self.tabs.add(self.level_tab, text="Level Editor")
         self.tabs.add(self.mesh_tab, text="Mesh Editor")
         self.tabs.add(self.material_tab, text="Material Editor")
         self.tabs.add(self.texture_tab, text="Texture Editor")
-        self.tabs.add(self.bf_repack_tab, text="BF Repack")
         self._build_asset_tab()
+        self._build_bf_repack_tab()
         self._build_ova_tab()
         self._build_level_tab()
         self._build_mesh_tab()
         self._build_material_tab()
         self._build_texture_tab()
-        self._build_bf_repack_tab()
 
         self.status = tk.StringVar(value="Ready")
         ttk.Label(root, textvariable=self.status, relief="sunken", anchor="w").pack(fill="x", pady=(8, 0))
 
     def _build_bf_repack_tab(self) -> None:
         ttk.Label(self.bf_repack_tab, text="BF Repack", font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
-        ttk.Label(self.bf_repack_tab, text="Operazioni compatibili con bf_repacker_2018_05_23_1419. Il BF aperto viene usato come template per Build.").pack(anchor="w", pady=(4, 14))
         actions = ttk.Frame(self.bf_repack_tab)
         actions.pack(fill="x")
         ttk.Button(actions, text="Export all assets → ROOT", command=self.extract_all_assets).pack(side="left")
@@ -2493,6 +2493,56 @@ class JadeToolkit(tk.Tk):
         ttk.Label(box, text="Build richiede la cartella ROOT prodotta da Export all assets e il BF originale aperto come template.").pack(anchor="w")
         ttk.Label(box, text="Esempio: ROOT\Engine Datas\...  /  ROOT\Bin\size.grs").pack(anchor="w", pady=(5, 0))
 
+        info_box = ttk.LabelFrame(self.bf_repack_tab, text="BF Information", padding=8)
+        info_box.pack(fill="both", expand=True, pady=(12, 0))
+        self.bf_info_text = tk.Text(info_box, height=22, wrap="none", state="disabled", font=("Consolas", 9), relief="flat", borderwidth=0)
+        self.bf_info_text.pack(side="left", fill="both", expand=True)
+        ttk.Scrollbar(info_box, orient="vertical", command=self.bf_info_text.yview).pack(side="right", fill="y")
+        self._set_bf_repack_info("Nessun BF aperto.")
+
+    def _set_bf_repack_info(self, text: str) -> None:
+        if hasattr(self, "bf_info_text"):
+            self.bf_info_text.configure(state="normal")
+            self.bf_info_text.delete("1.0", "end")
+            self.bf_info_text.insert("1.0", text)
+            self.bf_info_text.configure(state="disabled")
+
+    def _refresh_bf_repack_info(self) -> None:
+        path = self.project.path if getattr(self.project, "kind", None) == "bf" else None
+        if path is None:
+            self._set_bf_repack_info("Nessun BF aperto.")
+            return
+        try:
+            raw = path.read_bytes()
+            if len(raw) < 68:
+                raise ValueError("File .bf troppo corto per l'header legacy.")
+            vals = struct.unpack_from("<4sIIIQQIIIIIIiII", raw, 0)
+            magic, version, fcount, dcount, unk2, unk3, capacity, unk4, main_id, fcount2, dcount2, file_id_offset, unk5, unk6, last = vals
+            if magic != b"BIG\0" or version not in (37, 38):
+                raise ValueError("Disponibile per BF legacy v37/v38.")
+            fp_entry=68; fp_data=fcount*8; fp_total=capacity*8
+            fe_entry=fp_entry+fp_total; fe_data=fcount*84; fe_total=capacity*84
+            fo_entry=fe_entry+fe_total; fo_total=capacity*84
+            folder_count=0; pos=fo_entry
+            while pos+84<=len(raw) and struct.unpack_from("<i",raw,pos+4)[0]!=0:
+                folder_count+=1; pos+=84
+            fo_data=folder_count*84; unk_off=fo_entry+fo_total-136
+            unk=struct.unpack_from("<i",raw,unk_off)[0] if 0<=unk_off<=len(raw)-4 else 0
+            hpos=fo_entry+fo_total-4
+            while hpos+4<=len(raw) and struct.unpack_from("<i",raw,hpos)[0]==0: hpos+=4
+            htotal=struct.unpack_from("<i",raw,hpos)[0] if hpos+4<=len(raw) else 0
+            size_i=next((i for i in range(fcount) if raw[fe_entry+i*84+20:fe_entry+i*84+84].split(b"\0",1)[0].decode("ascii",errors="replace").strip()=="size.grs"),None)
+            se=sd=st=-1; sc=0
+            if size_i is not None:
+                se=struct.unpack_from("<I",raw,fp_entry+size_i*8)[0]+4; st=struct.unpack_from("<I",raw,fe_entry+size_i*84)[0]
+                q=se
+                while q+8<=len(raw) and struct.unpack_from("<I",raw,q)[0]!=0: sc+=1; q+=8
+                sd=sc*8
+            hx=lambda v:f"0x{v:X}"
+            lines=["BF Header Info",f"[00] magic: {magic.decode('ascii',errors='replace').rstrip(chr(0))}",f"[04] unk1: {version}",f"[08] fcount: {fcount}",f"[12] dcount: {dcount}",f"[16] unk2: {unk2}",f"[24] unk3: {unk3}",f"[32] capacity: {capacity}",f"[36] unk4: {unk4}",f"[40] main_id: {hx(main_id)}",f"[44] fcount_2: {fcount2}",f"[48] dcount_2: {dcount2}",f"[52] fileIdTableOffset: {file_id_offset}",f"[56] unk5: {unk5}",f"[60] unk6: {unk6}",f"[64] last: {last}","header length: 68",f"BF header total length: {htotal}","","Field Pos Table Info",f"table entry: {fp_entry}",f"data length: {fp_data}",f"total length: {fp_total}","","File Entry Table Info",f"table entry: {fe_entry}",f"data length: {fe_data}",f"total length: {fe_total}","","Folder Entry Table Info",f"[{unk_off}] unk: {unk}",f"table entry: {fo_entry}",f"data length: {fo_data}",f"total length: {fo_total}","","Size.grs Table Info",f"table entry: {se}",f"data length: {sd}",f"total length: {st}",f"files count: {sc}"]
+            self._set_bf_repack_info("\n".join(lines))
+        except Exception as exc:
+            self._set_bf_repack_info(f"Informazioni BF non disponibili.\n\n{exc}")
     def _build_asset_tab(self) -> None:
         top = ttk.Frame(self.asset_tab)
         top.pack(fill="x")
@@ -2559,8 +2609,6 @@ class JadeToolkit(tk.Tk):
         ttk.Button(bar, text="Diagnose", command=self.diagnose_ova).pack(side="left", padx=6)
         self.ova_mode_btn = ttk.Button(bar, text="OVA: Jade reale", command=self.toggle_ova_mode)
         self.ova_mode_btn.pack(side="left", padx=6)
-        ttk.Button(bar, text="Save modified .BIN", command=self.save_bin).pack(side="left", padx=6)
-        ttk.Button(bar, text="Rebuild .BF", command=self.rebuild_edited_bf).pack(side="left", padx=6)
         self.ova_source = ttk.Label(bar, text="Nessuna sorgente OVA")
         self.ova_source.pack(side="right")
 
@@ -3263,6 +3311,7 @@ class JadeToolkit(tk.Tk):
             self.project.open_bf(Path(path))
             self.refresh_assets()
             self._refresh_title()
+            self._refresh_bf_repack_info()
             self._log(f"INFO  BF aperto: v{self.project.info.version}, {len(self.project.assets):,} entry indicizzate, FAT={self.project.info.num_fat}")
         except Exception as exc:
             self._log(f"ERROR Import BF: {exc}")
@@ -3310,6 +3359,7 @@ class JadeToolkit(tk.Tk):
         self.project = JadeProject()
         self.refresh_assets()
         self._refresh_title()
+        self._refresh_bf_repack_info()
         self._clear_tree(self.var_tree)
         self._set_text(self.ova_text, "")
         self._log("Progetto chiuso")
@@ -3467,17 +3517,29 @@ class JadeToolkit(tk.Tk):
                 raise ValueError("Apri prima il BF originale per mantenere la stessa gerarchia delle cartelle.")
             info = read_bigfile(self.project.path)
             done = 0
+            failed: list[str] = []
             for entry in info.entries:
                 if entry.parent != 1 or "wolinfo" in entry.name.casefold() or entry.name.casefold() == "size.grs":
                     continue
                 dec = _legacy_asset_path(root.parent, folders, entry).with_suffix(".dec")
                 if not dec.is_file():
                     continue
-                enc = dec.with_suffix(".enc")
-                enc.write_bytes(compress_pop_lzo(dec.read_bytes()))
-                done += 1
-            self._log(f"OK    Compress all .DEC: {done:,} file compressi (.enc)")
-            messagebox.showinfo("Compress all .DEC", f"Creati {done:,} file .ENC nella struttura ROOT.")
+                bin_path = dec.with_suffix(".bin")
+                try:
+                    bin_path.write_bytes(compress_pop_lzo(dec.read_bytes()))
+                    done += 1
+                except Exception as exc:
+                    failed.append(f"{dec.name}: {exc}")
+                    self._log(f"WARN  Compress all .DEC saltato {dec}: {exc}")
+            self._log(f"OK    Compress all .DEC: {done:,} file compressi (.bin)")
+            if failed:
+                messagebox.showwarning(
+                    "Compress all .DEC",
+                    f"Creati {done:,} file .BIN nella struttura ROOT.\n\n"
+                    f"{len(failed):,} file non compressi; vedi il log per i dettagli."
+                )
+            else:
+                messagebox.showinfo("Compress all .DEC", f"Creati {done:,} file .BIN nella struttura ROOT.")
         except Exception as exc:
             self._log(f"ERROR Compress all: {exc}")
             messagebox.showerror("Compress all .DEC", str(exc))
