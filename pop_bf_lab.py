@@ -847,53 +847,49 @@ def _parse_pop_file_entries(data: bytes) -> list[PopFileEntry]:
 
 
 def _scan_pop_textures(data: bytes) -> list[TextureInfo]:
-    """Find textures by walking the real POP FileEntry table, not raw marker hits."""
+    """Find Jade texture entries, including PAL8, DXT1, DXT3 and 4-bit formats."""
     textures: list[TextureInfo] = []
     for entry in _parse_pop_file_entries(data):
         if entry.size < 56 or entry.data_type is None:
             continue
-        marker = struct.unpack_from("<I", data, entry.data_offset + 32)[0]
-        if marker != 0xC0DEC0DE:
+        # FileEntry data begins with four bytes before the Jade texture header.
+        if (struct.unpack_from("<I", data, entry.data_offset + 4)[0] != 0xFFFFFFFF
+                or struct.unpack_from("<I", data, entry.data_offset + 24)[0] != 0xCAD01234
+                or struct.unpack_from("<I", data, entry.data_offset + 32)[0] != 0xC0DEC0DE):
             continue
         width, height = struct.unpack_from("<hh", data, entry.data_offset + 12)
         texture_type = struct.unpack_from("<I", data, entry.data_offset + 40)[0]
-        if texture_type not in (0, 1, 7) or not (1 <= width <= 8192 and 1 <= height <= 8192):
+        version = struct.unpack_from("<I", data, entry.data_offset + 36)[0]
+        if texture_type not in (0, 1, 5, 6, 7, 11) or not (1 <= width <= 8192 and 1 <= height <= 8192):
             continue
-        data_offset = entry.data_offset + (60 if texture_type == 1 else 56)
+        data_offset = entry.data_offset + 56
+        if texture_type in (1, 5):
+            data_offset += 4
+        elif texture_type == 11 and version >= 4:
+            data_offset += 8
         data_end = entry.data_offset + entry.size
         if data_end <= data_offset:
             continue
-        header_w, header_h = struct.unpack_from("<II", data, entry.data_offset + 44)
-        stored_w, stored_h = width, height
-        if texture_type in (0, 7):
-            candidate_w, candidate_h = header_w // 2, header_h // 2
-            candidate_size = candidate_w * candidate_h * 4
-            if (candidate_w >= width and candidate_h >= height and candidate_size > 0
-                    and (data_end - data_offset) >= candidate_size
-                    and (data_end - data_offset) % candidate_size == 0):
-                stored_w, stored_h = candidate_w, candidate_h
-        if not (1 <= stored_w <= 16384 and 1 <= stored_h <= 16384):
-            continue
+        actual_w, actual_h = struct.unpack_from("<II", data, entry.data_offset + 44)
+        # Jade Toolkit uses these actual dimensions directly; the old /2 rule
+        # made modded textures appear missing or with a wrong data contract.
+        stored_w, stored_h = (actual_w, actual_h) if 1 <= actual_w <= 8192 and 1 <= actual_h <= 8192 else (width, height)
         payload_size = data_end - data_offset
+        blocks = max(1, (stored_w + 3) // 4) * max(1, (stored_h + 3) // 4)
         if texture_type == 7:
-            if payload_size == 4:
-                fmt = "Raw BGRA8 (reference)"
-            elif payload_size == stored_w * stored_h * 4:
-                fmt = "Raw BGRA8"
-            else:
-                fmt = "Type 7 (unknown payload)"
+            fmt = "Raw BGRA8 (reference)" if payload_size == 4 else ("Raw BGRA8" if payload_size == stored_w * stored_h * 4 else "DXT5")
+        elif texture_type == 6:
+            fmt = "DXT3" if payload_size >= blocks * 16 else "DXT3 (truncated)"
+        elif texture_type == 5:
+            fmt = "DXT1" if payload_size >= blocks * 8 else "DXT1 (truncated)"
         elif texture_type == 0:
-            base_size = stored_w * stored_h * 4
-            if payload_size == stored_w * stored_h * 3:
-                fmt = "TGA/BGR24"
-            elif payload_size >= base_size:
-                fmt = "TGA/BGRA8"
-            else:
-                fmt = "Type 0 (truncated)"
-        else:
+            fmt = "TGA/BGR24" if payload_size == stored_w * stored_h * 3 else ("TGA/BGRA8" if payload_size >= stored_w * stored_h * 4 else "Type 0 (truncated)")
+        elif texture_type == 1:
             fmt = "8-bit palette"
+        else:
+            fmt = "4-bit grayscale"
         textures.append(TextureInfo(len(textures), entry.data_offset, data_offset, data_end,
-                                    width, height, texture_type, entry.key, fmt,
+                                    stored_w, stored_h, texture_type, entry.key, fmt,
                                     stored_w, stored_h))
     return textures
 
@@ -976,6 +972,12 @@ def _infer_dxt5_mip_count(width: int, height: int, payload_size: int) -> int:
         f"Payload DXT5 originale {payload_size:,} B non corrisponde a un numero intero di mipmap per {width}x{height}."
     )
 
+
+def _compressed_dds_for_preview(payload: bytes, tex: TextureInfo) -> bytes:
+    """Wrap a DXT1/DXT3 payload for Pillow without altering embedded bytes."""
+    if tex.texture_type not in (5, 6):
+        raise ValueError(f"Formato compresso non supportato: type {tex.texture_type}.")
+    return _build_dds(payload, tex.width, tex.height, _build_dds_header(tex.width, tex.height, 0, tex.texture_type))
 
 def _build_type7_dds(payload: bytes, width: int, height: int) -> bytes:
     """Build a DDS for POP type 7, accepting DXT5 or raw BGRA payloads."""
@@ -1107,6 +1109,18 @@ def _build_tga_header(width: int, height: int, pixel_depth: int = 32) -> bytes:
     header[16] = pixel_depth
     return bytes(header)
 
+
+def _build_4bit_tga(width: int, height: int, packed: bytes) -> bytes:
+    """Expand Jade's low-nibble-first 4-bit grayscale texture format."""
+    pixel_count = width * height
+    if len(packed) < (pixel_count + 1) // 2:
+        raise ValueError("Dati 4-bit insufficienti per questa texture.")
+    decoded = bytearray(pixel_count * 4)
+    for pixel in range(pixel_count):
+        nibble = (packed[pixel // 2] & 0x0F) if pixel % 2 == 0 else (packed[pixel // 2] >> 4)
+        value = nibble * 17
+        decoded[pixel * 4:pixel * 4 + 4] = bytes((value, value, value, 255))
+    return _build_tga_header(width, height, 32) + bytes(decoded)
 
 def _build_palette_tga(width: int, height: int, palette: bytes, indices: bytes) -> bytes:
     """Expand an 8-bit POP palette texture to a standalone 32-bit TGA."""
@@ -2152,25 +2166,30 @@ def _tga_payload_from_file(path: Path, texture: TextureInfo, original: bytes) ->
     return bytes(payload)
 
 
-def _palette_payload_from_file(path: Path, texture: TextureInfo, palette: bytes) -> bytes:
-    """Convert any image to indices into the original POP 256-color palette."""
+def _palette_payload_from_image(image, texture: TextureInfo, palette: bytes,
+                                original_payload: bytes) -> bytes:
+    """Encode the base PAL8 level and preserve native mipmap/padding bytes."""
     if len(palette) < 1024:
         raise ValueError("Palette POP incompleta: servono 256 colori RGBA.")
-    image = _image_rgba(path, texture.width, texture.height)
     palette_rgba = [tuple(palette[i:i + 4]) for i in range(0, 1024, 4)]
-    pixels = image.getdata()
+    pixels = image.get_flattened_data()
     indices = bytearray(texture.width * texture.height)
-    # A small cache avoids repeating the nearest-color search for flat/limited
-    # color images while keeping the conversion fully self-contained.
     cache: dict[tuple[int, int, int, int], int] = {}
     for i, pixel in enumerate(pixels):
         if pixel not in cache:
             cache[pixel] = min(range(256), key=lambda n: sum((pixel[c] - palette_rgba[n][c]) ** 2 for c in range(4)))
         indices[i] = cache[pixel]
     expected = texture.data_end - texture.data_offset
-    if len(indices) != expected:
-        raise ValueError(f"Conversione palette non compatibile: originale {expected:,} B, convertito {len(indices):,} B.")
-    return bytes(indices)
+    if expected < len(indices) or len(original_payload) != expected:
+        raise ValueError(f"Payload palette non compatibile: originale {expected:,} B, base {len(indices):,} B.")
+    return bytes(indices) + original_payload[len(indices):]
+
+
+def _palette_payload_from_file(path: Path, texture: TextureInfo, palette: bytes,
+                               original_payload: bytes) -> bytes:
+    return _palette_payload_from_image(
+        _image_rgba(path, texture.width, texture.height), texture, palette, original_payload
+    )
 
 
 def ova_diagnostic_report(data: bytes, label: str = "buffer") -> list[str]:
@@ -4051,10 +4070,14 @@ class JadeToolkit(tk.Tk):
         self.texture_info.config(text=f"Offset 0x{tex.offset:08X} • payload 0x{tex.data_offset:08X}-0x{tex.data_end:08X} • {tex.width}x{tex.height} • {tex.format}")
         if tex.texture_type == 7:
             self._set_preview_from_tga(self.texture_preview, self._tga_blob_for_texture(tex)) if tex.format.startswith("Raw BGRA8") else self._set_preview_from_dds(self.texture_preview, self._dds_blob_for_texture(tex))
+        elif tex.texture_type in (5, 6):
+            self._set_preview_from_dds(self.texture_preview, _compressed_dds_for_preview(bytes(self._texture_data[tex.data_offset:tex.data_end]), tex))
         elif tex.texture_type == 0:
             self._set_preview_from_tga(self.texture_preview, self._tga_blob_for_texture(tex))
         elif tex.texture_type == 1:
             self._set_preview_from_tga(self.texture_preview, self._palette_tga_blob_for_texture(tex))
+        elif tex.texture_type == 11:
+            self._set_preview_from_tga(self.texture_preview, _build_4bit_tga(tex.width, tex.height, bytes(self._texture_data[tex.data_offset:tex.data_end])))
         else:
             self.texture_preview.configure(image="", text=f"{tex.format}\nPreview per questo formato nel prossimo step")
         self.texture_apply_btn.configure(state="disabled")
@@ -4146,10 +4169,17 @@ class JadeToolkit(tk.Tk):
                 if palette_entry is None:
                     raise ValueError(f"Palette 0x{palette_id:08X} non trovata nel BIN.")
                 palette = bytes(self._texture_data[palette_entry.data_offset + 4:palette_entry.data_offset + palette_entry.size])
-                payload = _palette_payload_from_file(Path(source), tex, palette)
+                payload = _palette_payload_from_file(
+                    Path(source), tex, palette,
+                    bytes(self._texture_data[tex.data_offset:tex.data_end]),
+                )
             else:
                 raise ValueError(f"Formato texture POP non supportato: type {tex.texture_type}.")
             self._texture_replacement = (Path(source), payload)
+            # Jade scanlines are vertically opposite to conventional image files.
+            # Apply this correction by default; the user can still toggle it off.
+            self._texture_flip_y = True
+            self._update_texture_transform_label()
             if tex.texture_type == 7:
                 preview_dds = _build_dds(payload, tex.width, tex.height,
                                          _build_dds_header(tex.width, tex.height,
@@ -4165,6 +4195,7 @@ class JadeToolkit(tk.Tk):
                                                  bytes(self._texture_data[palette_entry.data_offset + 4:palette_entry.data_offset + palette_entry.size]),
                                                  payload)
                 self._set_preview_from_tga(self.texture_replacement_preview, preview)
+            self._preview_texture_transform()
             self.texture_info.config(text=f"Importata: {Path(source).name} • {len(payload):,} B • compatibile con {tex.width}x{tex.height} {tex.format}")
             self.texture_apply_btn.configure(state="normal")
             self._log(f"OK    Texture convertita: {source} -> {len(payload):,} B DXT5 {tex.width}x{tex.height}")
@@ -4243,7 +4274,8 @@ class JadeToolkit(tk.Tk):
                     payload = _encode_dxt5(source_image, mip_count)
                 elif tex.texture_type == 0:
                     transformed = source_image.tobytes()
-                    payload = bytearray(len(payload))
+                    # Preserve bytes after the visible level (mips/padding).
+                    payload = bytearray(payload)
                     for i in range(0, len(transformed), 4):
                         r, g, b, a = transformed[i:i + 4]
                         payload[i:i + 4] = bytes((b, g, r, a))
@@ -4254,16 +4286,7 @@ class JadeToolkit(tk.Tk):
                     if palette_entry is None:
                         raise ValueError("Palette della texture non trovata.")
                     palette = bytes(self._texture_data[palette_entry.data_offset + 4:palette_entry.data_offset + palette_entry.size])
-                    temp_path = None
-                    pixels = source_image.getdata()
-                    palette_rgba = [tuple(palette[i:i + 4]) for i in range(0, 1024, 4)]
-                    cache = {}
-                    indexed = bytearray(tex.width * tex.height)
-                    for i, pixel in enumerate(pixels):
-                        if pixel not in cache:
-                            cache[pixel] = min(range(256), key=lambda n: sum((pixel[c] - palette_rgba[n][c]) ** 2 for c in range(4)))
-                        indexed[i] = cache[pixel]
-                    payload = bytes(indexed)
+                    payload = _palette_payload_from_image(source_image, tex, palette, payload)
                 if len(payload) != tex.data_end - tex.data_offset:
                     raise ValueError("La trasformazione non ha prodotto un payload della stessa dimensione dell'originale.")
             except Exception as exc:
@@ -4273,6 +4296,8 @@ class JadeToolkit(tk.Tk):
         self._texture_dirty = self._texture_data != bytearray(self._texture_original)
         if tex.texture_type == 7:
             self._set_preview_from_tga(self.texture_preview, self._tga_blob_for_texture(tex)) if tex.format.startswith("Raw BGRA8") else self._set_preview_from_dds(self.texture_preview, self._dds_blob_for_texture(tex))
+        elif tex.texture_type in (5, 6):
+            self._set_preview_from_dds(self.texture_preview, _compressed_dds_for_preview(bytes(self._texture_data[tex.data_offset:tex.data_end]), tex))
         elif tex.texture_type == 0:
             self._set_preview_from_tga(self.texture_preview, self._tga_blob_for_texture(tex))
         elif tex.texture_type == 1:
