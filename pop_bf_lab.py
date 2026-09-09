@@ -2997,7 +2997,7 @@ class JadeToolkit(tk.Tk):
         self.texture_preview.pack(fill="both", expand=True)
         replacement_box = ttk.LabelFrame(right, text="Texture da importare", padding=8)
         replacement_box.pack(fill="both", expand=True, pady=(8, 0))
-        self.texture_replacement_preview = tk.Label(replacement_box, text="Importa un .dds compatibile", anchor="center", justify="center", bg=self._dark["field"], fg=self._dark["muted"])
+        self.texture_replacement_preview = tk.Label(replacement_box, text="Import a replacement texture", anchor="center", justify="center", bg=self._dark["field"], fg=self._dark["muted"])
         self.texture_replacement_preview.pack(fill="both", expand=True)
         self.texture_info = ttk.Label(right, text="", justify="left")
         self.texture_info.pack(fill="x", pady=(8, 0))
@@ -4061,7 +4061,7 @@ class JadeToolkit(tk.Tk):
         if not tex:
             return
         self._texture_replacement = None
-        self.texture_replacement_preview.configure(image="", text="Importa un .dds compatibile")
+        self.texture_replacement_preview.configure(image="", text="Import a replacement texture")
         self.texture_replacement_preview.image = None
         self._texture_rotation = 0
         self._texture_flip_x = False
