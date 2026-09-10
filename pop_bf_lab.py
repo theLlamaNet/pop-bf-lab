@@ -1323,8 +1323,12 @@ def _encode_literal_lzo(block: bytes) -> bytes:
 
 def compress_pop_lzo(data: bytes) -> bytes:
     """Compress POP blocks using the bundled LZO 1.08 binary."""
-    if len(data) < 8 or data[4:8] != b"\x99\xC0\xFF\xEE":
-        raise ValueError("Il BIN non contiene il magic POP 0x99C0FFEE a offset 4.")
+    # POP retail assets use FFEE, while later/prototype WOWs use FFFE.
+    # The marker identifies the FileEntry stream, not the LZO codec; retain
+    # the original bytes and accept either wrapper when recompressing.
+    pop_markers = (b"\x99\xC0\xFF\xEE", b"\x99\xC0\xFF\xFE")
+    if len(data) < 8 or data[4:8] not in pop_markers:
+        raise ValueError("Il BIN non contiene un magic POP valido (0x99C0FFEE/0x99C0FFFE) a offset 4.")
     helper = ROOT / "pop_lzo_native.ps1"
     dll = ROOT / "lzo.dll"
     if not helper.is_file() or not dll.is_file():
@@ -1762,7 +1766,13 @@ def _patch_texture_key_in_asset(asset_data: bytes, texture_key: int, replacement
     """Patch every matching copy of a POP texture key inside one decoded asset."""
     data = bytearray(asset_data)
     matches = 0
-    for tex in _scan_pop_textures(data):
+    try:
+        textures = _scan_pop_textures(data)
+    except (ValueError, struct.error):
+        # A BF also contains non-POP resources. They cannot hold a POP
+        # texture record, so skip them while looking for duplicate texture keys.
+        return asset_data, 0
+    for tex in textures:
         if tex.key != texture_key:
             continue
         if tex.texture_type != texture_type or tex.width != width or tex.height != height:
@@ -2446,7 +2456,7 @@ class JadeToolkit(tk.Tk):
 
         help_menu = tk.Menu(menu, tearoff=False, bg=palette["surface"], fg=palette["fg"],
                             activebackground=palette["select"], activeforeground=palette["fg"], borderwidth=0)
-        help_menu.add_command(label="About POP BF Lab", command=self.about)
+        help_menu.add_command(label="About PoP BF Lab", command=self.about)
         menu.add_cascade(label="Help", menu=help_menu)
         self.config(menu=menu)
 
@@ -3350,7 +3360,10 @@ class JadeToolkit(tk.Tk):
             self._refresh_title()
             state = "POP-LZO decompresso" if self.project.direct_compressed else "non compresso"
             self._log(f"INFO  BIN aperto: raw={len(raw):,} B, decoded={len(self.project.decoded_bin or b''):,} B, {state}")
-            self.analyze_current_ova()
+            if bin_path.stem.casefold() == "univers_oin_ff0c008e":
+                self.analyze_current_ova()
+            else:
+                self.tabs.select(self.asset_tab)
         except Exception as exc:
             self._log(f"ERROR Import BIN: {exc}")
             messagebox.showerror("Import BIN", str(exc))
@@ -3369,7 +3382,10 @@ class JadeToolkit(tk.Tk):
             self.refresh_assets()
             self._refresh_title()
             self._log(f"INFO  DEC aperto: {dec_path} ({len(self._ova_data):,} B)")
-            self.analyze_current_ova()
+            if dec_path.stem.casefold() == "univers_oin_ff0c008e":
+                self.analyze_current_ova()
+            else:
+                self.tabs.select(self.asset_tab)
         except Exception as exc:
             self._log(f"ERROR Import DEC: {exc}")
             messagebox.showerror("Import DEC", str(exc))
@@ -3594,11 +3610,14 @@ class JadeToolkit(tk.Tk):
         if not target:
             return
         try:
-            data = bytes(self._ova_data) if self._ova_data else self.project.decoded_bin
+            data = bytes(self._texture_data) if self._texture_dirty else (bytes(self._ova_data) if self._ova_data else self.project.decoded_bin)
             self.project.decoded_bin = data
             self._log(f"INFO  Salvataggio BIN: decoded={len(data):,} B -> {target}")
             self.project.save_bin_as(Path(target), data)
             self._log(f"OK    BIN salvato: {target}")
+            if self._texture_dirty:
+                self._texture_original = data
+                self._texture_dirty = False
             self._ova_dirty = False
         except Exception as exc:
             self._log(f"ERROR Save BIN: {exc}")
@@ -3612,10 +3631,13 @@ class JadeToolkit(tk.Tk):
         if not target:
             return
         try:
-            data = bytes(self._ova_data) if self._ova_data else self.project.decoded_bin
+            data = bytes(self._texture_data) if self._texture_dirty else (bytes(self._ova_data) if self._ova_data else self.project.decoded_bin)
             self.project.decoded_bin = data
             Path(target).write_bytes(data)
             self._log(f"OK    DEC salvato: {target} ({len(data):,} B)")
+            if self._texture_dirty:
+                self._texture_original = data
+                self._texture_dirty = False
             self._ova_dirty = False
         except Exception as exc:
             self._log(f"ERROR Save DEC: {exc}")
@@ -3906,7 +3928,23 @@ class JadeToolkit(tk.Tk):
         if self._ova_dirty and self._ova_source_asset is not None:
             replacements[self._ova_source_asset.index] = bytes(self._ova_data)
         if self._texture_dirty and self._texture_source_asset is not None:
-            replacements[self._texture_source_asset.index] = bytes(self._texture_data)
+            try:
+                selected_entry = next((entry for entry in self.project.info.entries
+                                       if entry.index == self._texture_source_asset.index), None)
+                texture = self._texture_selected()
+                if selected_entry is None or texture is None:
+                    raise ValueError("Impossibile risalire all'entry BF o alla texture modificata.")
+                texture_replacements, touched = _collect_texture_key_replacements(
+                    self.project.path, selected_entry, texture.key,
+                    bytes(self._texture_data[texture.data_offset:texture.data_end]),
+                    texture.texture_type, texture.width, texture.height, bytes(self._texture_data),
+                )
+            except Exception as exc:
+                self._log(f"ERROR Save BF: {exc}")
+                messagebox.showerror("Save BF", str(exc))
+                return
+            replacements.update(texture_replacements)
+            self._log(f"INFO  Texture key 0x{texture.key:08X}: {len(touched)} asset BF da aggiornare")
         if self._material_dirty and self._material_source_asset is not None:
             replacements[self._material_source_asset.index] = bytes(self._material_data)
 
@@ -4326,7 +4364,7 @@ class JadeToolkit(tk.Tk):
         if not target:
             return
         try:
-            if self.project.kind == "bin":
+            if self.project.kind in ("bin", "dec"):
                 self.project.decoded_bin = bytes(self._texture_data)
                 self.project.save_bin_as(Path(target), bytes(self._texture_data))
             else:

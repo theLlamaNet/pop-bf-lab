@@ -31,8 +31,9 @@ $init = [MiniJadeLzoNative]::__lzo_init3()
 if ($init -ne 0) { throw "LZO initialization failed (rc=$init)." }
 
 $input = [IO.File]::ReadAllBytes($InputFile)
-if ($input.Length -lt 8 -or [BitConverter]::ToString($input, 4, 4).Replace('-', '') -ne '99C0FFEE') {
-    throw 'Input does not contain POP magic 99C0FFEE at offset 4.'
+$popMagic = if ($input.Length -ge 8) { [BitConverter]::ToString($input, 4, 4).Replace('-', '') } else { '' }
+if ($popMagic -notin @('99C0FFEE', '99C0FFFE')) {
+    throw 'Input does not contain POP magic 99C0FFEE or 99C0FFFE at offset 4.'
 }
 
 $blockSize = 131072
