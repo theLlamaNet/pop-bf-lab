@@ -915,12 +915,18 @@ def _build_dds(raw_payload: bytes, width: int, height: int, header_template: byt
 
 def _dds_blob_for_dump(texture_data: bytes | bytearray, tex: TextureInfo) -> bytes:
     """Build a standalone DDS while preserving the embedded compressed payload exactly."""
-    if tex.texture_type != 7:
-        raise ValueError("Solo le texture POP type 7 possono essere scaricate come DDS.")
+    if tex.texture_type not in (5, 6, 7):
+        raise ValueError("Solo le texture POP DXT1, DXT3 o DXT5 possono essere scaricate come DDS.")
     payload = bytes(texture_data[tex.data_offset:tex.data_end])
+    if tex.texture_type in (5, 6):
+        bytes_per_block = 8 if tex.texture_type == 5 else 16
+        mip_count = _infer_mip_count(tex.storage_width, tex.storage_height, len(payload), bytes_per_block)
+        return _build_dds(
+            payload, tex.storage_width, tex.storage_height,
+            _build_dds_header(tex.storage_width, tex.storage_height, mip_count - 1, tex.texture_type),
+        )
     if len(payload) == tex.storage_width * tex.storage_height * 4:
         return _build_tga_header(tex.storage_width, tex.storage_height, 32) + payload
-    mip_count = _infer_dxt5_mip_count(tex.storage_width, tex.storage_height, len(payload))
     return _build_type7_dds(payload, tex.storage_width, tex.storage_height)
 
 
@@ -996,23 +1002,21 @@ def _full_mip_count(width: int, height: int) -> int:
 
 
 def _dxt5_payload_for_converted_texture(path: Path, texture: TextureInfo) -> bytes:
-    """Encode DXT5 for DXT1/PAL8, retaining their mip count when it is known."""
+    """Encode DXT5 for PAL8 textures, retaining their mip count when it is known."""
     payload_size = texture.data_end - texture.data_offset
     try:
-        if texture.texture_type == 5:
-            mip_count = _infer_mip_count(texture.width, texture.height, payload_size, 8)
-        else:  # PAL8 stores one byte per pixel at every mip level.
-            total, w, h, mip_count = 0, texture.width, texture.height, 0
-            while mip_count < 16:
-                total += w * h
-                mip_count += 1
-                if total == payload_size:
-                    break
-                if total > payload_size or (w == 1 and h == 1):
-                    raise ValueError
-                w, h = max(1, w // 2), max(1, h // 2)
-            else:
+        # PAL8 stores one byte per pixel at every mip level.
+        total, w, h, mip_count = 0, texture.width, texture.height, 0
+        while mip_count < 16:
+            total += w * h
+            mip_count += 1
+            if total == payload_size:
+                break
+            if total > payload_size or (w == 1 and h == 1):
                 raise ValueError
+            w, h = max(1, w // 2), max(1, h // 2)
+        else:
+            raise ValueError
     except ValueError:
         mip_count = _full_mip_count(texture.width, texture.height)
     return _encode_dxt5(_image_rgba(path, texture.width, texture.height), mip_count)
@@ -1137,6 +1141,88 @@ def _encode_dxt5(image, mip_count: int) -> bytes:
                         pixels.append(rgba[min(x, width - 1), min(y, height - 1)])
                 out.extend(_encode_dxt5_block(pixels))
     return bytes(out)
+
+
+def _encode_dxt1_block(pixels: list[tuple[int, int, int, int]]) -> bytes:
+    """Encode one BC1/DXT1 block, including DXT1 punch-through alpha."""
+    transparent = [pixel[3] < 128 for pixel in pixels]
+    opaque = [pixel for pixel, is_transparent in zip(pixels, transparent) if not is_transparent]
+    if not opaque:
+        return b"\x00\x00\x00\x00\xff\xff\xff\xff"
+
+    colors = [(pixel[0], pixel[1], pixel[2]) for pixel in opaque]
+    min_rgb = tuple(min(color[i] for color in colors) for i in range(3))
+    max_rgb = tuple(max(color[i] for color in colors) for i in range(3))
+    c0, c1 = _rgb565(max_rgb), _rgb565(min_rgb)
+    has_transparency = any(transparent)
+    if has_transparency:
+        # BC1's three-colour mode (c0 <= c1) reserves index 3 for alpha 0.
+        if c0 > c1:
+            c0, c1 = c1, c0
+    else:
+        # Four-colour mode needs c0 > c1. Avoid accidentally selecting the
+        # transparent BC1 mode for a flat, fully opaque block.
+        if c0 <= c1:
+            c0 = min(0xFFFF, c1 + 1)
+            if c0 <= c1:
+                c1 = max(0, c0 - 1)
+
+    rgb0, rgb1 = _unpack565(c0), _unpack565(c1)
+    if has_transparency:
+        palette = [
+            rgb0,
+            rgb1,
+            tuple((rgb0[i] + rgb1[i]) // 2 for i in range(3)),
+        ]
+    else:
+        palette = [
+            rgb0,
+            rgb1,
+            tuple((2 * rgb0[i] + rgb1[i]) // 3 for i in range(3)),
+            tuple((rgb0[i] + 2 * rgb1[i]) // 3 for i in range(3)),
+        ]
+
+    indices = 0
+    for i, pixel in enumerate(pixels):
+        if transparent[i]:
+            index = 3
+        else:
+            color = pixel[:3]
+            index = min(
+                range(len(palette)),
+                key=lambda n: sum((color[channel] - palette[n][channel]) ** 2 for channel in range(3)),
+            )
+        indices |= index << (2 * i)
+    return c0.to_bytes(2, "little") + c1.to_bytes(2, "little") + indices.to_bytes(4, "little")
+
+
+def _encode_dxt1(image, mip_count: int = 1) -> bytes:
+    """Pure-Python DXT1 encoder for POP type-5 textures."""
+    from PIL import Image
+
+    out = bytearray()
+    for level, (width, height) in enumerate(_dxt5_mip_sizes(*image.size, mip_count)):
+        level_image = image if level == 0 else image.resize((width, height), Image.Resampling.LANCZOS)
+        rgba = level_image.load()
+        for by in range(0, height, 4):
+            for bx in range(0, width, 4):
+                pixels = [
+                    rgba[min(x, width - 1), min(y, height - 1)]
+                    for y in range(by, by + 4)
+                    for x in range(bx, bx + 4)
+                ]
+                out.extend(_encode_dxt1_block(pixels))
+    return bytes(out)
+
+
+def _dxt1_payload_from_file(path: Path, texture: TextureInfo) -> bytes:
+    """Encode a replacement as POP DXT1 (type 5), as Jade Toolkit does.
+
+    Jade's writer emits one DXT1 base level and clears the texture mip field.
+    Keeping format 5 is essential: changing a game DXT1 texture to type 7
+    changes the entry layout and can make the renderer read wrong bytes.
+    """
+    return _encode_dxt1(_image_rgba(path, texture.width, texture.height))
 
 
 def _build_tga_header(width: int, height: int, pixel_depth: int = 32) -> bytes:
@@ -1834,7 +1920,7 @@ def _patch_texture_key_in_asset(asset_data: bytes, texture_key: int, replacement
         # A BF also contains non-POP resources. They cannot hold a POP
         # texture record, so skip them while looking for duplicate texture keys.
         return asset_data, 0
-    # Work backwards: a PAL8/DXT1 -> DXT5 conversion changes FileEntry size.
+    # Work backwards: a texture replacement can change its FileEntry size.
     for tex in reversed(textures):
         if tex.key != texture_key:
             continue
@@ -1848,16 +1934,27 @@ def _patch_texture_key_in_asset(asset_data: bytes, texture_key: int, replacement
             continue
         if tex.texture_type != source_type:
             continue
-        # tex.offset is the FileEntry data start.  The Jade texture header is
-        # 56 B long here; DXT1 has an additional 4-B prefix after it, which a
-        # type-7 texture must not retain.
+        # tex.offset is the FileEntry data start. The Jade texture header is
+        # 56 B long here; types 1 and 5 have an additional four-byte prefix.
         header_end = tex.offset + 56
         if header_end > tex.data_end:
             continue
         entry = bytearray(data[tex.offset:header_end])
         struct.pack_into("<I", entry, 40, target_type)
-        struct.pack_into("<I", entry, 52, 0)  # Jade Toolkit's mip-count field
-        replacement_entry = bytes(entry) + replacement_payload
+        # Match Jade Toolkit: replacements in DXT/BGRA formats carry just the
+        # base level and reset Jade's mip-count field.
+        if target_type in (0, 5, 6, 7):
+            struct.pack_into("<I", entry, 52, 0)
+        if target_type in (1, 5):
+            # A DXT1 replacement must retain the native prefix (unlike a
+            # PAL8 -> DXT5 conversion, which intentionally removes it).
+            prefix = (bytes(data[header_end:tex.data_offset])
+                      if tex.texture_type == target_type else b"\x00\x00\x00\x00")
+            if len(prefix) != 4:
+                continue
+        else:
+            prefix = b""
+        replacement_entry = bytes(entry) + prefix + replacement_payload
         struct.pack_into("<I", data, tex.offset - 12, len(replacement_entry))
         data[tex.offset:tex.data_end] = replacement_entry
         matches += 1
@@ -4249,6 +4346,11 @@ class JadeToolkit(tk.Tk):
                     _build_dds_header(tex.width, tex.height,
                                       _infer_dxt5_mip_count(tex.width, tex.height, len(payload)) - 1, 7)
                 )
+            elif target_type in (5, 6):
+                blob = _build_dds(
+                    payload, tex.width, tex.height,
+                    _build_dds_header(tex.width, tex.height, 0, target_type),
+                )
             elif target_type == 0:
                 blob = _build_tga_header(tex.width, tex.height) + payload
             elif tex.texture_type == 1:
@@ -4279,13 +4381,16 @@ class JadeToolkit(tk.Tk):
         if not source:
             return
         try:
-            target_type = 7 if tex.texture_type in (1, 5) else tex.texture_type
+            target_type = 7 if tex.texture_type == 1 else tex.texture_type
             if tex.texture_type == 7:
                 payload = _dds_payload_from_file(Path(source), tex, bytes(self._texture_data))
-            elif tex.texture_type in (1, 5):
-                # Match Jade Toolkit's Auto mode: indexed and DXT1 entries
-                # are rebuilt as type 7 instead of writing invalid old-format
-                # bytes back into their original payload contract.
+            elif tex.texture_type == 5:
+                # Jade Toolkit keeps existing DXT1 textures as type 5. Their
+                # four-byte native prefix is retained while applying the patch.
+                payload = _dxt1_payload_from_file(Path(source), tex)
+            elif tex.texture_type == 1:
+                # Palette textures intentionally become DXT5, matching the
+                # existing Auto conversion path.
                 payload = _dxt5_payload_for_converted_texture(Path(source), tex)
             elif tex.texture_type == 0:
                 payload = _tga_payload_from_file(Path(source), tex, bytes(self._texture_data))
@@ -4315,6 +4420,12 @@ class JadeToolkit(tk.Tk):
                                          _build_dds_header(tex.width, tex.height,
                                                            _infer_dxt5_mip_count(tex.width, tex.height, len(payload)) - 1, 7))
                 self._set_preview_from_dds(self.texture_replacement_preview, preview_dds)
+            elif target_type in (5, 6):
+                preview_dds = _build_dds(
+                    payload, tex.width, tex.height,
+                    _build_dds_header(tex.width, tex.height, 0, target_type),
+                )
+                self._set_preview_from_dds(self.texture_replacement_preview, preview_dds)
             else:
                 if tex.texture_type == 0:
                     preview = _build_tga_header(tex.width, tex.height) + payload
@@ -4326,10 +4437,13 @@ class JadeToolkit(tk.Tk):
                                                  payload)
                 self._set_preview_from_tga(self.texture_replacement_preview, preview)
             self._preview_texture_transform()
-            target_label = "DXT5 (conversione automatica)" if target_type == 7 and tex.texture_type != 7 else tex.format
+            target_label = (
+                "DXT5 (conversione automatica)" if target_type == 7 and tex.texture_type != 7
+                else ("DXT1" if target_type == 5 else tex.format)
+            )
             self.texture_info.config(text=f"Importata: {Path(source).name} • {len(payload):,} B • {tex.width}x{tex.height} {target_label}")
             self.texture_apply_btn.configure(state="normal")
-            self._log(f"OK    Texture convertita: {source} -> {len(payload):,} B DXT5 {tex.width}x{tex.height}")
+            self._log(f"OK    Texture convertita: {source} -> {len(payload):,} B {target_label} {tex.width}x{tex.height}")
         except Exception as exc:
             self._texture_replacement = None
             self.texture_apply_btn.configure(state="disabled")
@@ -4347,19 +4461,33 @@ class JadeToolkit(tk.Tk):
             source_path = self.project.path
             if source_path is None:
                 raise ValueError("Nessun file .BF sorgente disponibile.")
-            # Keep the actual embedded bytes untouched. For type 7 this is the
-            # compressed DXT5 payload plus the original texture header.
-            suffix = ".dds" if tex.texture_type == 7 else ".tga"
+            # Keep a native dump, then always create a PNG alongside it. DXT1
+            # and DXT3 must be wrapped as DDS; writing their compressed blocks
+            # under a .tga extension produces an unreadable/truncated image.
+            suffix = ".dds" if tex.texture_type in (5, 6, 7) and not tex.format.startswith("Raw BGRA8") else ".tga"
             target = source_path.parent / f"{source_path.stem}_texture_{tex.index + 1:03d}{suffix}"
-            if tex.texture_type == 7:
+            png_target = source_path.parent / f"{source_path.stem}_texture_{tex.index + 1:03d}.png"
+            if tex.texture_type in (5, 6, 7):
                 blob = _dds_blob_for_dump(self._texture_data, tex)
             elif tex.texture_type == 0:
-                blob = _build_tga_header(tex.width, tex.height) + bytes(self._texture_data[tex.data_offset:tex.data_end])
+                blob = _build_tga_header(tex.width, tex.height) + bytes(
+                    self._texture_data[tex.data_offset:tex.data_offset + tex.width * tex.height * 4]
+                )
+            elif tex.texture_type == 11:
+                blob = _build_4bit_tga(
+                    tex.width, tex.height, bytes(self._texture_data[tex.data_offset:tex.data_end])
+                )
             else:
                 blob = self._palette_tga_blob_for_texture(tex)
+            try:
+                from PIL import Image
+                image = Image.open(io.BytesIO(blob)).convert("RGBA")
+                image.save(png_target, "PNG")
+            except Exception as exc:
+                raise ValueError(f"Impossibile convertire il dump in PNG: {exc}") from exc
             target.write_bytes(blob)
-            self._log(f"OK    Texture dump: {target}")
-            messagebox.showinfo("Dump texture", f"Creato:\n{target}")
+            self._log(f"OK    Texture dump: {target} • PNG: {png_target}")
+            messagebox.showinfo("Dump texture", f"Creati:\n{target}\n{png_target}")
         except Exception as exc:
             self._log(f"ERROR Dump texture: {exc}")
             messagebox.showerror("Dump texture", str(exc))
@@ -4377,7 +4505,8 @@ class JadeToolkit(tk.Tk):
         source_type = (getattr(self, "_texture_patch_source_type", tex.texture_type)
                        if getattr(self, "_texture_patch_key", tex.key) == tex.key
                        else tex.texture_type)
-        if target_type == tex.texture_type and len(payload) != tex.data_end - tex.data_offset:
+        if (target_type == tex.texture_type and target_type != 5
+                and len(payload) != tex.data_end - tex.data_offset):
             messagebox.showerror("Texture Swap", "La texture importata non ha la stessa dimensione compressa dell'originale.")
             return
         if self._texture_rotation or self._texture_flip_x or self._texture_flip_y:
@@ -4388,6 +4517,11 @@ class JadeToolkit(tk.Tk):
                         payload, tex.width, tex.height,
                         _build_dds_header(tex.width, tex.height,
                                           _infer_dxt5_mip_count(tex.width, tex.height, len(payload)) - 1, 7)
+                    )
+                elif target_type in (5, 6):
+                    source_blob = _build_dds(
+                        payload, tex.width, tex.height,
+                        _build_dds_header(tex.width, tex.height, 0, target_type),
                     )
                 elif target_type == 0:
                     source_blob = _build_tga_header(tex.width, tex.height) + payload
@@ -4406,6 +4540,8 @@ class JadeToolkit(tk.Tk):
                 if target_type == 7:
                     mip_count = _infer_dxt5_mip_count(tex.width, tex.height, len(payload))
                     payload = _encode_dxt5(source_image, mip_count)
+                elif target_type == 5:
+                    payload = _encode_dxt1(source_image)
                 elif target_type == 0:
                     transformed = source_image.tobytes()
                     # Preserve bytes after the visible level (mips/padding).
@@ -4421,7 +4557,8 @@ class JadeToolkit(tk.Tk):
                         raise ValueError("Palette della texture non trovata.")
                     palette = bytes(self._texture_data[palette_entry.data_offset + 4:palette_entry.data_offset + palette_entry.size])
                     payload = _palette_payload_from_image(source_image, tex, palette, payload)
-                if target_type == tex.texture_type and len(payload) != tex.data_end - tex.data_offset:
+                if (target_type == tex.texture_type and target_type != 5
+                        and len(payload) != tex.data_end - tex.data_offset):
                     raise ValueError("La trasformazione non ha prodotto un payload della stessa dimensione dell'originale.")
             except Exception as exc:
                 messagebox.showerror("Texture Swap", f"Impossibile applicare rotazione/flip: {exc}")
