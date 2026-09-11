@@ -973,6 +973,51 @@ def _infer_dxt5_mip_count(width: int, height: int, payload_size: int) -> int:
     )
 
 
+def _infer_mip_count(width: int, height: int, payload_size: int, bytes_per_block: int) -> int:
+    """Infer mip levels for a block-compressed POP payload."""
+    total = 0
+    w, h = width, height
+    for mip_count in range(1, 17):
+        total += max(1, (w + 3) // 4) * max(1, (h + 3) // 4) * bytes_per_block
+        if total == payload_size:
+            return mip_count
+        if total > payload_size or (w == 1 and h == 1):
+            break
+        w, h = max(1, w // 2), max(1, h // 2)
+    raise ValueError("Il payload non corrisponde a una catena mipmap completa.")
+
+
+def _full_mip_count(width: int, height: int) -> int:
+    count = 1
+    while width > 1 or height > 1:
+        width, height = max(1, width // 2), max(1, height // 2)
+        count += 1
+    return count
+
+
+def _dxt5_payload_for_converted_texture(path: Path, texture: TextureInfo) -> bytes:
+    """Encode DXT5 for DXT1/PAL8, retaining their mip count when it is known."""
+    payload_size = texture.data_end - texture.data_offset
+    try:
+        if texture.texture_type == 5:
+            mip_count = _infer_mip_count(texture.width, texture.height, payload_size, 8)
+        else:  # PAL8 stores one byte per pixel at every mip level.
+            total, w, h, mip_count = 0, texture.width, texture.height, 0
+            while mip_count < 16:
+                total += w * h
+                mip_count += 1
+                if total == payload_size:
+                    break
+                if total > payload_size or (w == 1 and h == 1):
+                    raise ValueError
+                w, h = max(1, w // 2), max(1, h // 2)
+            else:
+                raise ValueError
+    except ValueError:
+        mip_count = _full_mip_count(texture.width, texture.height)
+    return _encode_dxt5(_image_rgba(path, texture.width, texture.height), mip_count)
+
+
 def _compressed_dds_for_preview(payload: bytes, tex: TextureInfo) -> bytes:
     """Wrap a DXT1/DXT3 payload for Pillow without altering embedded bytes."""
     if tex.texture_type not in (5, 6):
@@ -1778,8 +1823,9 @@ def _repack_legacy_bigfile_changes(path: Path, replacements: dict[int, bytes], o
 
 
 def _patch_texture_key_in_asset(asset_data: bytes, texture_key: int, replacement_payload: bytes,
-                                texture_type: int, width: int, height: int) -> tuple[bytes, int]:
-    """Patch every matching copy of a POP texture key inside one decoded asset."""
+                                source_type: int, target_type: int,
+                                width: int, height: int) -> tuple[bytes, int]:
+    """Patch matching POP texture entries, rebuilding their header if needed."""
     data = bytearray(asset_data)
     matches = 0
     try:
@@ -1788,21 +1834,40 @@ def _patch_texture_key_in_asset(asset_data: bytes, texture_key: int, replacement
         # A BF also contains non-POP resources. They cannot hold a POP
         # texture record, so skip them while looking for duplicate texture keys.
         return asset_data, 0
-    for tex in textures:
+    # Work backwards: a PAL8/DXT1 -> DXT5 conversion changes FileEntry size.
+    for tex in reversed(textures):
         if tex.key != texture_key:
             continue
-        if tex.texture_type != texture_type or tex.width != width or tex.height != height:
+        if tex.width != width or tex.height != height:
             continue
-        if tex.data_end - tex.data_offset != len(replacement_payload):
+        # The selected asset is already converted when saving a BF. Count it
+        # without touching it, so it remains in the replacement set.
+        if (tex.texture_type == target_type
+                and bytes(data[tex.data_offset:tex.data_end]) == replacement_payload):
+            matches += 1
             continue
-        data[tex.data_offset:tex.data_end] = replacement_payload
+        if tex.texture_type != source_type:
+            continue
+        # tex.offset is the FileEntry data start.  The Jade texture header is
+        # 56 B long here; DXT1 has an additional 4-B prefix after it, which a
+        # type-7 texture must not retain.
+        header_end = tex.offset + 56
+        if header_end > tex.data_end:
+            continue
+        entry = bytearray(data[tex.offset:header_end])
+        struct.pack_into("<I", entry, 40, target_type)
+        struct.pack_into("<I", entry, 52, 0)  # Jade Toolkit's mip-count field
+        replacement_entry = bytes(entry) + replacement_payload
+        struct.pack_into("<I", data, tex.offset - 12, len(replacement_entry))
+        data[tex.offset:tex.data_end] = replacement_entry
         matches += 1
     return bytes(data), matches
 
 
 def _collect_texture_key_replacements(path: Path, selected: BigFileEntry,
                                       texture_key: int, replacement_payload: bytes,
-                                      texture_type: int, width: int, height: int,
+                                      source_type: int, target_type: int,
+                                      width: int, height: int,
                                       selected_decoded: bytes) -> tuple[dict[int, bytes], list[str]]:
     """Find the same logical texture in other BF assets and patch all valid copies.
 
@@ -1824,7 +1889,7 @@ def _collect_texture_key_replacements(path: Path, selected: BigFileEntry,
             except Exception:
                 continue
         patched, count = _patch_texture_key_in_asset(
-            decoded, texture_key, replacement_payload, texture_type, width, height
+            decoded, texture_key, replacement_payload, source_type, target_type, width, height
         )
         if count:
             replacements[entry.index] = patched
@@ -3953,6 +4018,9 @@ class JadeToolkit(tk.Tk):
                 texture_replacements, touched = _collect_texture_key_replacements(
                     self.project.path, selected_entry, texture.key,
                     bytes(self._texture_data[texture.data_offset:texture.data_end]),
+                    (getattr(self, "_texture_patch_source_type", texture.texture_type)
+                     if getattr(self, "_texture_patch_key", texture.key) == texture.key
+                     else texture.texture_type),
                     texture.texture_type, texture.width, texture.height, bytes(self._texture_data),
                 )
             except Exception as exc:
@@ -4174,14 +4242,14 @@ class JadeToolkit(tk.Tk):
             return
         try:
             from PIL import Image, ImageTk
-            _source, payload = replacement
-            if tex.texture_type == 7:
+            _source, payload, target_type = replacement
+            if target_type == 7:
                 blob = _build_dds(
                     payload, tex.width, tex.height,
                     _build_dds_header(tex.width, tex.height,
                                       _infer_dxt5_mip_count(tex.width, tex.height, len(payload)) - 1, 7)
                 )
-            elif tex.texture_type == 0:
+            elif target_type == 0:
                 blob = _build_tga_header(tex.width, tex.height) + payload
             elif tex.texture_type == 1:
                 palette_id = struct.unpack_from("<I", self._texture_data, tex.data_offset - 4)[0]
@@ -4211,8 +4279,14 @@ class JadeToolkit(tk.Tk):
         if not source:
             return
         try:
+            target_type = 7 if tex.texture_type in (1, 5) else tex.texture_type
             if tex.texture_type == 7:
                 payload = _dds_payload_from_file(Path(source), tex, bytes(self._texture_data))
+            elif tex.texture_type in (1, 5):
+                # Match Jade Toolkit's Auto mode: indexed and DXT1 entries
+                # are rebuilt as type 7 instead of writing invalid old-format
+                # bytes back into their original payload contract.
+                payload = _dxt5_payload_for_converted_texture(Path(source), tex)
             elif tex.texture_type == 0:
                 payload = _tga_payload_from_file(Path(source), tex, bytes(self._texture_data))
             elif tex.texture_type == 1:
@@ -4229,12 +4303,14 @@ class JadeToolkit(tk.Tk):
                 )
             else:
                 raise ValueError(f"Formato texture POP non supportato: type {tex.texture_type}.")
-            self._texture_replacement = (Path(source), payload)
+            self._texture_replacement = (Path(source), payload, target_type)
+            self._texture_patch_source_type = tex.texture_type
+            self._texture_patch_key = tex.key
             # Jade scanlines are vertically opposite to conventional image files.
             # Apply this correction by default; the user can still toggle it off.
             self._texture_flip_y = True
             self._update_texture_transform_label()
-            if tex.texture_type == 7:
+            if target_type == 7:
                 preview_dds = _build_dds(payload, tex.width, tex.height,
                                          _build_dds_header(tex.width, tex.height,
                                                            _infer_dxt5_mip_count(tex.width, tex.height, len(payload)) - 1, 7))
@@ -4250,7 +4326,8 @@ class JadeToolkit(tk.Tk):
                                                  payload)
                 self._set_preview_from_tga(self.texture_replacement_preview, preview)
             self._preview_texture_transform()
-            self.texture_info.config(text=f"Importata: {Path(source).name} • {len(payload):,} B • compatibile con {tex.width}x{tex.height} {tex.format}")
+            target_label = "DXT5 (conversione automatica)" if target_type == 7 and tex.texture_type != 7 else tex.format
+            self.texture_info.config(text=f"Importata: {Path(source).name} • {len(payload):,} B • {tex.width}x{tex.height} {target_label}")
             self.texture_apply_btn.configure(state="normal")
             self._log(f"OK    Texture convertita: {source} -> {len(payload):,} B DXT5 {tex.width}x{tex.height}")
         except Exception as exc:
@@ -4296,20 +4373,23 @@ class JadeToolkit(tk.Tk):
         if not replacement:
             messagebox.showinfo("Texture Swap", "Import a texture before applying changes.")
             return
-        _source, payload = replacement
-        if len(payload) != tex.data_end - tex.data_offset:
+        _source, payload, target_type = replacement
+        source_type = (getattr(self, "_texture_patch_source_type", tex.texture_type)
+                       if getattr(self, "_texture_patch_key", tex.key) == tex.key
+                       else tex.texture_type)
+        if target_type == tex.texture_type and len(payload) != tex.data_end - tex.data_offset:
             messagebox.showerror("Texture Swap", "La texture importata non ha la stessa dimensione compressa dell'originale.")
             return
         if self._texture_rotation or self._texture_flip_x or self._texture_flip_y:
             try:
                 from PIL import Image
-                if tex.texture_type == 7:
+                if target_type == 7:
                     source_blob = _build_dds(
                         payload, tex.width, tex.height,
                         _build_dds_header(tex.width, tex.height,
                                           _infer_dxt5_mip_count(tex.width, tex.height, len(payload)) - 1, 7)
                     )
-                elif tex.texture_type == 0:
+                elif target_type == 0:
                     source_blob = _build_tga_header(tex.width, tex.height) + payload
                 else:
                     source_blob = self._palette_tga_blob_for_texture(tex)
@@ -4323,10 +4403,10 @@ class JadeToolkit(tk.Tk):
                 source_image = _transform_texture_image(
                     source_image, self._texture_rotation, self._texture_flip_x, self._texture_flip_y
                 )
-                if tex.texture_type == 7:
+                if target_type == 7:
                     mip_count = _infer_dxt5_mip_count(tex.width, tex.height, len(payload))
                     payload = _encode_dxt5(source_image, mip_count)
-                elif tex.texture_type == 0:
+                elif target_type == 0:
                     transformed = source_image.tobytes()
                     # Preserve bytes after the visible level (mips/padding).
                     payload = bytearray(payload)
@@ -4334,42 +4414,44 @@ class JadeToolkit(tk.Tk):
                         r, g, b, a = transformed[i:i + 4]
                         payload[i:i + 4] = bytes((b, g, r, a))
                     payload = bytes(payload)
-                elif tex.texture_type == 1:
+                elif target_type == 1:
                     palette_id = struct.unpack_from("<I", self._texture_data, tex.data_offset - 4)[0]
                     palette_entry = next((e for e in self._texture_file_entries if e.key == palette_id), None)
                     if palette_entry is None:
                         raise ValueError("Palette della texture non trovata.")
                     palette = bytes(self._texture_data[palette_entry.data_offset + 4:palette_entry.data_offset + palette_entry.size])
                     payload = _palette_payload_from_image(source_image, tex, palette, payload)
-                if len(payload) != tex.data_end - tex.data_offset:
+                if target_type == tex.texture_type and len(payload) != tex.data_end - tex.data_offset:
                     raise ValueError("La trasformazione non ha prodotto un payload della stessa dimensione dell'originale.")
             except Exception as exc:
                 messagebox.showerror("Texture Swap", f"Impossibile applicare rotazione/flip: {exc}")
                 return
-        self._texture_data[tex.data_offset:tex.data_end] = payload
+        patched, count = _patch_texture_key_in_asset(
+            bytes(self._texture_data), tex.key, payload, source_type, target_type,
+            tex.width, tex.height,
+        )
+        if not count:
+            messagebox.showerror("Texture Swap", "Texture selezionata non trovata nel buffer corrente.")
+            return
+        self._texture_data = bytearray(patched)
+        self._texture_file_entries = _parse_pop_file_entries(self._texture_data)
+        self._texture_infos = _scan_pop_textures(self._texture_data)
         self._texture_dirty = self._texture_data != bytearray(self._texture_original)
-        if tex.texture_type == 7:
-            self._set_preview_from_tga(self.texture_preview, self._tga_blob_for_texture(tex)) if tex.format.startswith("Raw BGRA8") else self._set_preview_from_dds(self.texture_preview, self._dds_blob_for_texture(tex))
-        elif tex.texture_type in (5, 6):
-            self._set_preview_from_dds(self.texture_preview, _compressed_dds_for_preview(bytes(self._texture_data[tex.data_offset:tex.data_end]), tex))
-        elif tex.texture_type == 0:
-            self._set_preview_from_tga(self.texture_preview, self._tga_blob_for_texture(tex))
-        elif tex.texture_type == 1:
-            self._set_preview_from_tga(self.texture_preview, self._palette_tga_blob_for_texture(tex))
-        if tex.texture_type == 7:
-            self._set_preview_from_dds(self.texture_replacement_preview, self._dds_blob_for_texture(tex))
-        elif tex.texture_type == 0:
-            self._set_preview_from_tga(self.texture_replacement_preview, self._tga_blob_for_texture(tex))
-        elif tex.texture_type == 1:
-            self._set_preview_from_tga(self.texture_replacement_preview, self._palette_tga_blob_for_texture(tex))
         self._texture_replacement = None
         self._texture_rotation = 0
         self._texture_flip_x = False
         self._texture_flip_y = False
         self._update_texture_transform_label()
         self.texture_apply_btn.configure(state="disabled")
-        self.texture_info.config(text=f"Sostituzione applicata • {tex.width}x{tex.height} • payload invariato {len(payload):,} B. Usa Save/Extract/Rebuild per scrivere il file.")
-        self._log(f"PATCH TEXTURE  key=0x{tex.key:08X} • payload={len(payload):,} B")
+        new_tex = next((item for item in self._texture_infos
+                        if item.key == tex.key and item.texture_type == target_type
+                        and item.width == tex.width and item.height == tex.height), None)
+        if new_tex is not None:
+            self.texture_tree.selection_set(f"tex_{new_tex.index}")
+            self.texture_tree.focus(f"tex_{new_tex.index}")
+            self.on_texture_selected()
+        self.texture_info.config(text=f"Sostituzione applicata • {tex.width}x{tex.height} • type {target_type} / {len(payload):,} B. Usa Save/Extract/Rebuild per scrivere il file.")
+        self._log(f"PATCH TEXTURE  key=0x{tex.key:08X} • type={target_type} • payload={len(payload):,} B")
 
     def save_texture_asset(self) -> None:
         if not self._texture_dirty or self._texture_source_asset is None:
@@ -4397,6 +4479,9 @@ class JadeToolkit(tk.Tk):
                     selected_entry,
                     texture.key,
                     bytes(self._texture_data[texture.data_offset:texture.data_end]),
+                    (getattr(self, "_texture_patch_source_type", texture.texture_type)
+                     if getattr(self, "_texture_patch_key", texture.key) == texture.key
+                     else texture.texture_type),
                     texture.texture_type,
                     texture.width,
                     texture.height,
