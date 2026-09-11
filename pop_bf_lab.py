@@ -1541,6 +1541,8 @@ def build_legacy_bf_from_folder(template: Path, root_dir: Path, output: Path) ->
         suffix = "..." if len(missing) > 8 else ""
         raise ValueError(f"La cartella ROOT è incompleta: mancano {len(missing)} file ({preview}{suffix}).")
 
+    _update_legacy_size_grs_payload(info, payloads, set(payloads))
+
     ordered = sorted(info.entries, key=lambda entry: entry.position)
     prefix_end = ordered[0].position
     rebuilt = bytearray(original[:prefix_end])
@@ -1553,7 +1555,8 @@ def build_legacy_bf_from_folder(template: Path, root_dir: Path, output: Path) ->
         rebuilt.extend(original[original_cursor:entry.position])
         new_positions[entry.index] = len(rebuilt)
         struct.pack_into("<I", rebuilt, file_id_base + entry.index * LEGACY_BF_FILE_TABLE_ENTRY_SIZE, new_positions[entry.index])
-        struct.pack_into("<I", rebuilt, file_entry_base + entry.index * LEGACY_BF_FILE_ENTRY_SIZE, len(payload))
+        if len(payload) != (entry.size & 0x7FFFFFFF):
+            struct.pack_into("<I", rebuilt, file_entry_base + entry.index * LEGACY_BF_FILE_ENTRY_SIZE, len(payload))
         rebuilt.extend(struct.pack("<I", len(payload)))
         rebuilt.extend(payload)
         original_cursor = entry.position + 4 + (entry.size & 0x7FFFFFFF)
