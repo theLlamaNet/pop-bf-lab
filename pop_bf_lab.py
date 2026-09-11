@@ -1268,29 +1268,25 @@ def _decompress_lzo_block(block: bytes, expected_size: int) -> bytes:
 
 
 def decompress_pop_lzo(data: bytes) -> bytes:
-    """Decode POP v37/v38's sequence of little-endian LZO blocks."""
+    """Decode POP's consecutive little-endian LZO blocks (up to 0x20000 each)."""
     compat = ROOT / "lzo_compat.dll"
+    native = None
     if compat.is_file():
         try:
             lib = ctypes.CDLL(str(compat))
             native = lib.lzo_bridge_decompress
-            native.argtypes = [
-                ctypes.POINTER(ctypes.c_ubyte), ctypes.c_uint,
-                ctypes.POINTER(ctypes.c_ubyte), ctypes.POINTER(ctypes.c_uint),
-            ]
+            native.argtypes = [ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t,
+                               ctypes.POINTER(ctypes.c_ubyte), ctypes.POINTER(ctypes.c_size_t)]
             native.restype = ctypes.c_int
         except (OSError, AttributeError):
             native = None
-    else:
-        native = None
-
     pos = 0
     output = bytearray()
     while pos + 8 <= len(data):
         dec_size, enc_size = struct.unpack_from("<2I", data, pos)
+        if dec_size == 0 or enc_size == 0:
+            break  # physical padding or optional terminator
         pos += 8
-        if dec_size == 0 and enc_size == 0:
-            break
         if enc_size > len(data) - pos:
             raise ValueError("Blocco LZO POP troncato.")
         block = data[pos:pos + enc_size]
@@ -1300,17 +1296,19 @@ def decompress_pop_lzo(data: bytes) -> bytes:
         elif native is not None:
             src = (ctypes.c_ubyte * len(block)).from_buffer_copy(block)
             dst = (ctypes.c_ubyte * dec_size)()
-            out_size = ctypes.c_uint(dec_size)
-            rc = native(src, enc_size, dst, ctypes.byref(out_size))
+            out_size = ctypes.c_size_t(dec_size)
+            rc = native(src, len(block), dst, ctypes.byref(out_size))
             if rc != 0 or out_size.value != dec_size:
                 raise ValueError(f"Decompressione LZO POP fallita (rc={rc}, output={out_size.value}, atteso={dec_size}).")
             output.extend(bytes(dst[:out_size.value]))
         else:
             output.extend(_decompress_lzo_block(block, dec_size))
+        # A short final block ends the stream; a full block may be followed by another.
         if dec_size < LZO_BLOCK_SIZE:
             break
+    if not output:
+        raise ValueError("Wrapper LZO POP vuoto o non valido.")
     return bytes(output)
-
 
 def _encode_literal_lzo(block: bytes) -> bytes:
     """Encode a small literal-only LZO1X stream; larger blocks stay raw."""
@@ -1351,7 +1349,12 @@ def compress_pop_lzo(data: bytes) -> bytes:
             raise RuntimeError(f"Compressione LZO POP fallita: {details or 'errore sconosciuto'}")
         if not target.is_file():
             raise RuntimeError("Il runtime LZO standalone non ha prodotto l'output.")
-        return target.read_bytes()
+        encoded = target.read_bytes()
+        if len(encoded) < 8:
+            raise RuntimeError("Il runtime LZO ha prodotto un wrapper troppo corto.")
+        if decompress_pop_lzo(encoded) != data:
+            raise RuntimeError("Verifica LZO fallita: il BIN ricompresso non restituisce i dati .DEC originali.")
+        return encoded
     finally:
         for child in temp_dir.glob("*"):
             child.unlink(missing_ok=True)
@@ -1492,6 +1495,30 @@ def _legacy_file_data_length(data: bytes, folder_index: int, name: str) -> int:
     return len(data)
 
 
+def _update_legacy_size_grs_payload(info: BigFileInfo, payloads: dict[int, bytes], changed_indices: set[int]) -> None:
+    """Refresh the logical LZO stream lengths stored by POP in size.grs."""
+    if not changed_indices:
+        return
+    size_entry = next((entry for entry in info.entries if entry.name.casefold() == "size.grs"), None)
+    if size_entry is None or size_entry.index not in payloads:
+        return
+    by_key = {entry.key: entry for entry in info.entries}
+    data = bytearray(payloads[size_entry.index])
+    changed = False
+    for offset in range(0, len(data) - 7, 8):
+        key, old_length = struct.unpack_from("<2I", data, offset)
+        if key == 0:
+            break
+        entry = by_key.get(key)
+        if entry is None or entry.index not in changed_indices or entry.index == size_entry.index:
+            continue
+        new_length = _legacy_file_data_length(payloads[entry.index], entry.parent, entry.name)
+        if new_length != old_length:
+            struct.pack_into("<I", data, offset + 4, new_length)
+            changed = True
+    if changed:
+        payloads[size_entry.index] = bytes(data)
+
 def build_legacy_bf_from_folder(template: Path, root_dir: Path, output: Path) -> int:
     """Rebuild a legacy BF from ROOT using the opened BF as its metadata template."""
     info = read_bigfile(template)
@@ -1519,7 +1546,7 @@ def build_legacy_bf_from_folder(template: Path, root_dir: Path, output: Path) ->
     rebuilt = bytearray(original[:prefix_end])
     original_cursor = prefix_end
     file_id_base = LEGACY_BF_HEADER_SIZE
-    file_entry_base = file_id_base + info.max_file * LEGACY_BF_FILE_TABLE_ENTRY_SIZE
+    file_entry_base = file_id_base + info.size_fat * LEGACY_BF_FILE_TABLE_ENTRY_SIZE
     new_positions: dict[int, int] = {}
     for entry in ordered:
         payload = payloads[entry.index]
@@ -1561,6 +1588,7 @@ def _read_big_header(stream) -> BigFileInfo:
     magic, version, max_file, max_dir, _max_key, _root, _free_file, _free_dir, size_fat, num_fat, universe_key = struct.unpack("<4s10I", header)
     if magic not in (b"BIG\0", b"BUG\0"):
         raise ValueError(f"Header BIG non riconosciuto: {magic!r}")
+    file_size = Path(stream.name).stat().st_size
     entries: list[BigFileEntry] = []
     descriptor_pos = 44
     for fat_index in range(num_fat):
@@ -1573,25 +1601,33 @@ def _read_big_header(stream) -> BigFileInfo:
         file_table = stream.read(fat_max_file * 8)
         ext_base = pos_fat + size_fat * 8
         stream.seek(ext_base)
-        ext_table = stream.read(fat_max_file * 88)
-        if len(file_table) != fat_max_file * 8 or len(ext_table) != fat_max_file * 88:
+        ext_table = stream.read(fat_max_file * LEGACY_BF_FILE_ENTRY_SIZE)
+        if len(file_table) != fat_max_file * 8 or len(ext_table) != fat_max_file * LEGACY_BF_FILE_ENTRY_SIZE:
             raise ValueError(f"FAT #{fat_index} troncata.")
         for i in range(fat_max_file):
             position, key = struct.unpack_from("<2I", file_table, i * 8)
             if key == 0xFFFFFFFF:
                 continue
-            ext = ext_table[i * 88:(i + 1) * 88]
-            size_on_disk = struct.unpack_from("<I", ext, 0)[0]
+            ext = ext_table[i * LEGACY_BF_FILE_ENTRY_SIZE:(i + 1) * LEGACY_BF_FILE_ENTRY_SIZE]
+            physical_size = struct.unpack_from("<I", ext, 0)[0] & 0x7FFFFFFF
             parent = struct.unpack_from("<I", ext, 12)[0]
             raw_name = ext[20:84].split(b"\0", 1)[0]
             name = raw_name.decode("ascii", errors="replace").strip() or f"<file_{first_index + i:06d}>"
-            entries.append(BigFileEntry(first_index + i, position, key, size_on_disk & 0x7FFFFFFF,
-                                        name, parent, fat_index, first_index,
-                                        bool(size_on_disk & 0x80000000)))
+            data_header_size = 0
+            compressed = False
+            compression = "none"
+            if version in (37, 38) and position + 4 <= file_size:
+                stream.seek(position)
+                if struct.unpack("<I", stream.read(4))[0] == physical_size:
+                    data_header_size = 4
+                    stream.seek(position + 4)
+                    compressed = _looks_like_pop_lzo(stream.read(min(32, physical_size)))
+                    compression = "POP-LZO" if compressed else "none"
+            entries.append(BigFileEntry(first_index + i, position, key, physical_size, name, parent,
+                                        fat_index, first_index, compressed, data_header_size, compression))
         descriptor_pos = next_pos_fat - 24 if next_pos_fat != 0xFFFFFFFF else descriptor_pos + 24
     entries.sort(key=lambda e: (e.fat_index, e.index))
     return BigFileInfo(Path(stream.name), version, max_file, max_dir, size_fat, num_fat, universe_key, magic == b"BUG\0", entries)
-
 
 def _read_legacy_bigfile(path: Path) -> BigFileInfo:
     with path.open("rb") as stream:
@@ -1627,13 +1663,9 @@ def _read_legacy_bigfile(path: Path) -> BigFileInfo:
 
 
 def read_bigfile(path: Path) -> BigFileInfo:
-    with path.open("rb") as stream:
-        header = stream.read(8)
-    if len(header) == 8 and header[:4] == b"BIG\0" and struct.unpack_from("<I", header, 4)[0] in (37, 38):
-        return _read_legacy_bigfile(path)
+    # POP v37/v38 uses the regular FAT header; size_of_fat can exceed file_count.
     with path.open("rb") as stream:
         return _read_big_header(stream)
-
 
 def read_bigfile_entry(path: Path, entry: BigFileEntry) -> bytes:
     with path.open("rb") as stream:
@@ -1650,18 +1682,6 @@ def _repack_legacy_bigfile(path: Path, selected: BigFileEntry, decoded_data: byt
     if info.version not in (37, 38):
         raise ValueError("La ricostruzione BF automatica è implementata per v37/v38.")
     selected_payload = compress_pop_lzo(decoded_data) if selected.compressed else decoded_data
-    original_payload_size = selected.size & 0x7FFFFFFF
-    # Most boolean edits keep the encoded size unchanged. In that case a
-    # surgical replacement is the strongest fidelity guarantee: every byte
-    # of the original BF container, including private padding/unknown areas,
-    # is retained verbatim.
-    if len(selected_payload) == original_payload_size:
-        rebuilt = bytearray(original)
-        start = selected.position + selected.data_header_size
-        rebuilt[start:start + len(selected_payload)] = selected_payload
-        output.write_bytes(rebuilt)
-        return
-    payloads: dict[int, bytes] = {}
     for entry in info.entries:
         if entry.index == selected.index:
             payloads[entry.index] = selected_payload
@@ -1669,6 +1689,7 @@ def _repack_legacy_bigfile(path: Path, selected: BigFileEntry, decoded_data: byt
             start = entry.position + entry.data_header_size
             length = entry.size & 0x7FFFFFFF
             payloads[entry.index] = original[start:start + length]
+    _update_legacy_size_grs_payload(info, payloads, {selected.index})
     # File-table order and physical payload order are not guaranteed to match.
     # Preserve the original physical ordering while updating each indexed
     # FileIdOffset to its new position.
@@ -1676,7 +1697,7 @@ def _repack_legacy_bigfile(path: Path, selected: BigFileEntry, decoded_data: byt
     prefix_end = ordered_entries[0].position
     prefix = bytearray(original[:prefix_end])
     file_id_base = LEGACY_BF_HEADER_SIZE
-    file_entry_base = file_id_base + info.max_file * LEGACY_BF_FILE_TABLE_ENTRY_SIZE
+    file_entry_base = file_id_base + info.size_fat * LEGACY_BF_FILE_TABLE_ENTRY_SIZE
     cursor = prefix_end
     original_cursor = prefix_end
     for entry in ordered_entries:
@@ -1686,7 +1707,7 @@ def _repack_legacy_bigfile(path: Path, selected: BigFileEntry, decoded_data: byt
         original_gap = original[original_cursor:entry.position]
         cursor += len(original_gap)
         struct.pack_into("<I", prefix, file_id_base + entry.index * 8, cursor)
-        size_value = len(payload) | (0x80000000 if entry.compressed else 0)
+        size_value = len(payload)
         struct.pack_into("<I", prefix, file_entry_base + entry.index * LEGACY_BF_FILE_ENTRY_SIZE, size_value)
         cursor += 4 + len(payload)
         original_cursor = entry.position + 4 + (entry.size & 0x7FFFFFFF)
@@ -1722,21 +1743,13 @@ def _repack_legacy_bigfile_changes(path: Path, replacements: dict[int, bytes], o
             payload = original[start:start + length]
         payloads[entry.index] = payload
 
-    if all(len(payloads[index]) == (entries_by_index[index].size & 0x7FFFFFFF)
-           for index in payloads):
-        rebuilt = bytearray(original)
-        for index in replacements:
-            entry = entries_by_index[index]
-            start = entry.position + entry.data_header_size
-            rebuilt[start:start + len(payloads[index])] = payloads[index]
-        output.write_bytes(rebuilt)
-        return
+    _update_legacy_size_grs_payload(info, payloads, set(replacements))
 
     ordered_entries = sorted(info.entries, key=lambda entry: entry.position)
     prefix_end = ordered_entries[0].position
     prefix = bytearray(original[:prefix_end])
     file_id_base = LEGACY_BF_HEADER_SIZE
-    file_entry_base = file_id_base + info.max_file * LEGACY_BF_FILE_TABLE_ENTRY_SIZE
+    file_entry_base = file_id_base + info.size_fat * LEGACY_BF_FILE_TABLE_ENTRY_SIZE
     cursor = prefix_end
     original_cursor = prefix_end
     for entry in ordered_entries:
@@ -1744,8 +1757,8 @@ def _repack_legacy_bigfile_changes(path: Path, replacements: dict[int, bytes], o
         original_gap = original[original_cursor:entry.position]
         cursor += len(original_gap)
         struct.pack_into("<I", prefix, file_id_base + entry.index * 8, cursor)
-        size_value = len(payload) | (0x80000000 if entry.compressed else 0)
-        struct.pack_into("<I", prefix, file_entry_base + entry.index * LEGACY_BF_FILE_TABLE_ENTRY_SIZE, size_value)
+        if len(payload) != (entry.size & 0x7FFFFFFF):
+            struct.pack_into("<I", prefix, file_entry_base + entry.index * LEGACY_BF_FILE_ENTRY_SIZE, len(payload))
         cursor += 4 + len(payload)
         original_cursor = entry.position + 4 + (entry.size & 0x7FFFFFFF)
 

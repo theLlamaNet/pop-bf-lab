@@ -43,14 +43,13 @@ while ($position -lt $input.Length) {
     $count = [Math]::Min($blockSize, $input.Length - $position)
     $block = New-Object byte[] $count
     [Array]::Copy($input, $position, $block, 0, $count)
-    $dst = New-Object byte[] ($count + [Math]::Floor($count / 64) + 64 + 8)
+    $dst = New-Object byte[] ($count + [Math]::Floor($count / 16) + 64 + 8)
     $outLength = $dst.Length
     $work = New-Object byte[] 65536
     $rc = [MiniJadeLzoNative]::lzo1x_1_compress($block, $count, $dst, [ref] $outLength, $work)
     if ($rc -ne 0) { throw "LZO compression failed (rc=$rc, block=$count bytes)." }
-
     $result.Write([BitConverter]::GetBytes([int]$count), 0, 4)
-    if ($outLength -gt $count) {
+    if ($outLength -ge $count) {
         $result.Write([BitConverter]::GetBytes([int]$count), 0, 4)
         $result.Write($block, 0, $block.Length)
     } else {
@@ -59,11 +58,7 @@ while ($position -lt $input.Length) {
     }
     $position += $count
 }
-
-$payloadLength = [int]$result.Length
-if ((($payloadLength + 4) % 2048) -ne 0) {
-    $diff = (([Math]::Floor($payloadLength / 2048) * 2048) + 2044) - $payloadLength
-    if ($diff -gt 0) { $result.Write((New-Object byte[] $diff), 0, $diff) }
-}
-
+# Payload plus the four-byte BF member-size prefix must end on a 0x800 sector.
+$padding = (2048 - (($result.Length + 4) % 2048)) % 2048
+if ($padding -gt 0) { $result.Write((New-Object byte[] $padding), 0, $padding) }
 [IO.File]::WriteAllBytes($OutputFile, $result.ToArray())
