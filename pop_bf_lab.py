@@ -1314,15 +1314,29 @@ def _build_dds(raw_payload: bytes, width: int, height: int, header_template: byt
 
 
 def _dds_blob_for_dump(texture_data: bytes | bytearray, tex: TextureInfo) -> bytes:
-    """Build a standalone DDS while preserving the embedded compressed payload exactly."""
+    """Build a standalone DDS from the compressed bytes in a POP texture entry."""
     if tex.texture_type not in (5, 6, 7):
         raise ValueError("Solo le texture POP DXT1, DXT3 o DXT5 possono essere scaricate come DDS.")
     payload = bytes(texture_data[tex.data_offset:tex.data_end])
     if tex.texture_type in (5, 6):
         bytes_per_block = 8 if tex.texture_type == 5 else 16
-        mip_count = _infer_mip_count(tex.storage_width, tex.storage_height, len(payload), bytes_per_block)
+        try:
+            mip_count = _infer_mip_count(tex.storage_width, tex.storage_height, len(payload), bytes_per_block)
+        except ValueError:
+            # Native POP type-5 entries can end with a four-byte container
+            # trailer after the BC1 levels. It is not DDS image data, and its
+            # value is not guaranteed to be zero. Accept it only when removing
+            # exactly one DWORD produces a complete mip chain.
+            if tex.texture_type != 5 or len(payload) <= 4:
+                raise
+            dds_payload = payload[:-4]
+            mip_count = _infer_mip_count(
+                tex.storage_width, tex.storage_height, len(dds_payload), bytes_per_block
+            )
+        else:
+            dds_payload = payload
         return _build_dds(
-            payload, tex.storage_width, tex.storage_height,
+            dds_payload, tex.storage_width, tex.storage_height,
             _build_dds_header(tex.storage_width, tex.storage_height, mip_count - 1, tex.texture_type),
         )
     if len(payload) == tex.storage_width * tex.storage_height * 4:
