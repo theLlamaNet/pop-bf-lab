@@ -138,12 +138,26 @@ class MaterialInfo:
     material_key: int | None
     texture_key: int | None
     normal_key: int | None = None
+    # A second Jade material layer is not inherently a normal map.  It is
+    # exposed separately and promoted to normal only for the WW archives.
+    secondary_key: int | None = None
     metallic: float = 0.0
     alpha: float = 1.0
     source_meshes: list[int] | None = None
     texture_offset: int | None = None
     specular_offset: int | None = None
     diffuse_offset: int | None = None
+    ambient: int = 0xFFFFFFFF
+    diffuse_color: int = 0xFFFFFFFF
+    specular_color: int = 0x00000000
+    opacity: float = 1.0
+    specular_exponent: float = 0.0
+    ambient_offset: int | None = None
+    diffuse_color_offset: int | None = None
+    specular_color_offset: int | None = None
+    opacity_offset: int | None = None
+    specular_exponent_offset: int | None = None
+    material_kind: int | None = None
 
 
 if OpenGLFrame is not None:
@@ -743,17 +757,89 @@ def _scan_pop_materials(data: bytes) -> tuple[dict[int, list[int]], dict[int, in
     return packs, materials
 
 
-def _scan_pop_material_records(data: bytes) -> dict[int, MaterialInfo]:
+def _classic_jade_material(entry: PopFileEntry, data: bytes) -> MaterialInfo | None:
+    """Decode the 32-byte Jade single-material form (GRO type 3)."""
+    if entry.data_type != 3 or entry.size < 36:
+        return None
+    base = entry.data_offset + 4
+    payload = data[base:entry.data_offset + entry.size]
+    ambient, diffuse, specular, spec_exp, opacity, _flags, texture_key, _mask = struct.unpack_from("<IIIffIII", payload, 0)
+    if texture_key in (0, 0xFFFFFFFF):
+        texture_key = None
+    if not math.isfinite(opacity) or not -0.01 <= opacity <= 1.01:
+        opacity = 1.0
+    if not math.isfinite(spec_exp):
+        spec_exp = 0.0
+    return MaterialInfo(index=0, material_id=0, material_key=entry.key, texture_key=texture_key,
+                        metallic=max(0.0, min(128.0, spec_exp)), alpha=max(0.0, min(1.0, opacity)),
+                        ambient=ambient, diffuse_color=diffuse, specular_color=specular,
+                        opacity=opacity, specular_exponent=spec_exp,
+                        ambient_offset=base + 0, diffuse_color_offset=base + 4,
+                        specular_color_offset=base + 8, specular_exponent_offset=base + 12,
+                        opacity_offset=base + 16, texture_offset=base + 24, source_meshes=[])
+
+
+def _modern_jade_material(entry: PopFileEntry, data: bytes) -> MaterialInfo | None:
+    """Decode Jade leaf materials (kinds 4..9), including multitexture layers."""
+    payload_offset = entry.data_offset + 4
+    payload = data[payload_offset:entry.data_offset + entry.size]
+    if len(payload) < 28:
+        return None
+    kind = struct.unpack_from("<I", payload, 0)[0]
+    base_by_kind = {4: 40, 5: 40, 6: 40, 7: 42, 8: 50, 9: 63}
+    if kind not in base_by_kind:
+        return None
+    base = base_by_kind[kind]
+    if base + 4 > len(payload):
+        return None
+    layer_stride = {8: 26, 9: 39}.get(kind, 0)
+    offsets = [base]
+    if layer_stride and (len(payload) - (base + 4)) % layer_stride == 0:
+        offsets = list(range(base, len(payload) - 3, layer_stride))
+    keys = [struct.unpack_from("<I", payload, off)[0] for off in offsets]
+    keys = [key for key in keys if key not in (0, 0xFFFFFFFF)]
+    texture_key = keys[0] if keys else None
+    secondary_key = keys[1] if len(keys) > 1 else None
+    ambient, diffuse, specular = struct.unpack_from("<III", payload, 4)
+    spec_exp, opacity = struct.unpack_from("<ff", payload, 16)
+    if not math.isfinite(opacity) or not -0.01 <= opacity <= 1.01:
+        opacity = 1.0
+    if not math.isfinite(spec_exp):
+        spec_exp = 0.0
+    return MaterialInfo(
+        index=0, material_id=0, material_key=entry.key, texture_key=texture_key,
+        secondary_key=secondary_key, metallic=max(0.0, min(128.0, spec_exp)), alpha=max(0.0, min(1.0, opacity)),
+        ambient=ambient, diffuse_color=diffuse, specular_color=specular,
+        opacity=opacity, specular_exponent=spec_exp,
+        ambient_offset=payload_offset + 4, diffuse_color_offset=payload_offset + 8,
+        specular_color_offset=payload_offset + 12, specular_exponent_offset=payload_offset + 16,
+        opacity_offset=payload_offset + 20, texture_offset=payload_offset + base,
+        material_kind=kind, source_meshes=[],
+    )
+
+
+def _scan_pop_material_records(data: bytes, valid_texture_keys: set[int] | None = None) -> dict[int, MaterialInfo]:
     """Read the Jade type-5 material records used by the Blender Addon."""
     records: dict[int, MaterialInfo] = {}
     for entry in _parse_pop_file_entries(data):
         if entry.data_type != 5 or entry.size < 16:
             continue
         try:
+            # io_scene_pop identifies POP material records by FileEntry type 5.
+            # Type 3 has unrelated uses in these assets and must not be
+            # promoted to a material merely because its first 32 bytes fit.
             blob = data[entry.data_offset:entry.data_offset + entry.size]
             r = _PopReader(blob[4:])
             version = r.u32()
+            # POP's type-5 payload starts with a serialization version, not a
+            # Jade leaf-material kind. Versions 4..9 used to be mistaken for
+            # kind 4..9 and produced random/white texture assignments.
             if not 3 <= version <= 9:
+                modern = _modern_jade_material(entry, data)
+                if modern is not None:
+                    modern.index = len(records)
+                    modern.material_id = len(records)
+                    records[entry.key] = modern
                 continue
             r.u32()
             if version >= 8:
@@ -780,9 +866,21 @@ def _scan_pop_material_records(data: bytes) -> dict[int, MaterialInfo]:
             else:
                 texture_offset = entry.data_offset + 4 + r.pos
                 texture_key = r.u32()
+            secondary_key = None
+            if valid_texture_keys and texture_offset is not None:
+                # The Blender POP reader intentionally stopped after the base
+                # texture. Remaining aligned key fields are extra stages;
+                # accept only keys that actually resolve to a texture in this
+                # BF, which prevents flags/colours being misidentified.
+                for offset in range(r.pos, len(r.data) - 3, 4):
+                    candidate = struct.unpack_from("<I", r.data, offset)[0]
+                    if candidate != texture_key and candidate in valid_texture_keys:
+                        secondary_key = candidate
+                        break
             records[entry.key] = MaterialInfo(
                 index=len(records), material_id=len(records), material_key=entry.key,
-                texture_key=texture_key, metallic=max(0.0, min(1.0, float(specular))),
+                texture_key=texture_key, secondary_key=secondary_key,
+                metallic=max(0.0, min(1.0, float(specular))),
                 alpha=max(0.0, min(1.0, float(diffuse))), source_meshes=[],
                 texture_offset=texture_offset, specular_offset=specular_offset,
                 diffuse_offset=diffuse_offset,
@@ -892,6 +990,35 @@ def _scan_pop_textures(data: bytes) -> list[TextureInfo]:
                                     stored_w, stored_h, texture_type, entry.key, fmt,
                                     stored_w, stored_h))
     return textures
+
+
+def _decode_pop_texture_image(data: bytes, tex: TextureInfo):
+    """Return a PIL RGBA image for every previewable POP texture type."""
+    from PIL import Image
+    if tex.texture_type == 7:
+        blob = _dds_blob_for_dump(data, tex)
+    elif tex.texture_type in (5, 6):
+        blob = _compressed_dds_for_preview(bytes(data[tex.data_offset:tex.data_end]), tex)
+    elif tex.texture_type == 0:
+        pixel_bytes = tex.storage_width * tex.storage_height
+        payload = data[tex.data_offset:tex.data_end]
+        depth = 32 if len(payload) >= pixel_bytes * 4 else 24
+        blob = _build_tga_header(tex.storage_width, tex.storage_height, depth) + payload[:pixel_bytes * (depth // 8)]
+    elif tex.texture_type == 1:
+        entries = _parse_pop_file_entries(data)
+        if tex.data_offset < 4:
+            raise ValueError("Texture palette con offset non valido.")
+        palette_id = struct.unpack_from("<I", data, tex.data_offset - 4)[0]
+        palette_entry = next((entry for entry in entries if entry.key == palette_id), None)
+        if palette_entry is None:
+            raise ValueError(f"Palette 0x{palette_id:08X} non trovata.")
+        palette = data[palette_entry.data_offset + 4:palette_entry.data_offset + palette_entry.size]
+        blob = _build_palette_tga(tex.width, tex.height, palette, data[tex.data_offset:tex.data_end])
+    elif tex.texture_type == 11:
+        blob = _build_4bit_tga(tex.width, tex.height, data[tex.data_offset:tex.data_end])
+    else:
+        raise ValueError(f"Formato texture POP {tex.texture_type} non supportato.")
+    return Image.open(io.BytesIO(blob)).convert("RGBA")
 
 
 def _dds_payload_and_info(path: Path) -> tuple[bytes, int, int, str, bytes]:
@@ -2521,8 +2648,10 @@ class JadeToolkit(tk.Tk):
         self._material_infos: list[MaterialInfo] = []
         self._material_source_asset: Asset | None = None
         self._material_textures: dict[int, object] = {}
+        self._material_texture_sources: dict[int, Asset] = {}
         self._material_texture_photos: list[object] = []
         self._material_diffuse_path = tk.StringVar()
+        self._material_secondary_path = tk.StringVar()
         self._material_normal_path = tk.StringVar()
         self._material_metallic = tk.DoubleVar(value=0.0)
         self._material_alpha = tk.DoubleVar(value=1.0)
@@ -2934,9 +3063,9 @@ class JadeToolkit(tk.Tk):
         split.add(right, weight=5)
 
         ttk.Label(left, text="Materiali rilevati").pack(anchor="w")
-        self.material_tree = ttk.Treeview(left, columns=("name", "diffuse", "normal", "alpha", "metallic"), show="headings")
-        for c, t, w in (("name", "Material", 210), ("diffuse", "Diffuse", 110), ("normal", "Normal", 100),
-                        ("alpha", "Alpha", 65), ("metallic", "Metal", 65)):
+        self.material_tree = ttk.Treeview(left, columns=("name", "diffuse", "secondary", "opacity", "specular"), show="headings")
+        for c, t, w in (("name", "Material", 210), ("diffuse", "Diffuse", 110), ("secondary", "Secondary", 110),
+                        ("opacity", "Opacity", 65), ("specular", "Spec exp.", 72)):
             self.material_tree.heading(c, text=t)
             self.material_tree.column(c, width=w, anchor="w")
         self.material_tree.pack(fill="both", expand=True, pady=(5, 0))
@@ -2958,20 +3087,26 @@ class JadeToolkit(tk.Tk):
         self.material_diffuse_combo = ttk.Combobox(row, state="readonly", width=54)
         self.material_diffuse_combo.pack(side="left", fill="x", expand=True, padx=6)
         self.material_diffuse_combo.bind("<<ComboboxSelected>>", lambda _e: self._material_preview_changed())
+        ttk.Button(row, text="Open texture", command=lambda: self._open_material_texture("diffuse")).pack(side="right", padx=(0, 4))
         ttk.Button(row, text="Refresh", command=self._material_preview_changed).pack(side="right")
         row = ttk.Frame(editor); row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Normal map", width=18).pack(side="left")
+        ttk.Label(row, text="Secondary texture", width=18).pack(side="left")
+        ttk.Entry(row, textvariable=self._material_secondary_path).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(row, text="Open texture", command=lambda: self._open_material_texture("secondary")).pack(side="right")
+        row = ttk.Frame(editor); row.pack(fill="x", pady=2)
+        ttk.Label(row, text="Normal map (WW)", width=18).pack(side="left")
         ttk.Entry(row, textvariable=self._material_normal_path).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(row, text="Open texture", command=lambda: self._open_material_texture("normal")).pack(side="right", padx=(0, 4))
         ttk.Button(row, text="Add normal...", command=self.choose_material_normal).pack(side="right")
         row = ttk.Frame(editor); row.pack(fill="x", pady=(8, 2))
-        ttk.Label(row, text="Metallicity", width=18).pack(side="left")
-        self.material_metal_scale = ttk.Scale(row, from_=0.0, to=1.0, variable=self._material_metallic,
+        ttk.Label(row, text="Specular exponent", width=18).pack(side="left")
+        self.material_metal_scale = ttk.Scale(row, from_=0.0, to=128.0, variable=self._material_metallic,
                                               command=lambda _v: self._material_preview_changed())
         self.material_metal_scale.pack(side="left", fill="x", expand=True, padx=6)
         self.material_metal_value = ttk.Label(row, text="0.00", width=6)
         self.material_metal_value.pack(side="right")
         row = ttk.Frame(editor); row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Alpha (preview)", width=18).pack(side="left")
+        ttk.Label(row, text="Opacity (Jade)", width=18).pack(side="left")
         self.material_alpha_scale = ttk.Scale(row, from_=0.0, to=1.0, variable=self._material_alpha,
                                               command=lambda _v: self._material_preview_changed())
         self.material_alpha_scale.pack(side="left", fill="x", expand=True, padx=6)
@@ -2993,67 +3128,112 @@ class JadeToolkit(tk.Tk):
         self.material_info = ttk.Label(editor, text="Seleziona un materiale per modificarlo.", justify="left")
         self.material_info.pack(anchor="w", pady=(7, 0))
 
+    def _collect_material_texture_inventory(self, preferred_asset: Asset) -> dict[int, tuple[Asset, bytes, TextureInfo]]:
+        """Index physical textures across the opened BF, preferring the largest copy.
+
+        Jade archives commonly keep a material in one entry and its texture in
+        another.  Restricting previews to the selected entry was therefore the
+        main source of white materials in this editor.
+        """
+        assets = [preferred_asset]
+        if self.project.kind == "bf":
+            assets.extend(asset for asset in self.project.assets if asset.index != preferred_asset.index)
+        inventory: dict[int, tuple[Asset, bytes, TextureInfo]] = {}
+        total = len(assets)
+        for position, candidate in enumerate(assets, 1):
+            try:
+                candidate_data = self.project.read_asset(candidate)
+                candidate_textures = _scan_pop_textures(candidate_data)
+            except Exception:
+                continue
+            for texture in candidate_textures:
+                current = inventory.get(texture.key)
+                if current is None or texture.data_end - texture.data_offset > current[2].data_end - current[2].data_offset:
+                    inventory[texture.key] = (candidate, candidate_data, texture)
+            if position == 1 or position == total or position % 25 == 0:
+                self.status.set(f"Material Editor: indicizzazione texture {position}/{total}…")
+                self.update_idletasks()
+        return inventory
+
+    def _is_ww_normal_map_archive(self) -> bool:
+        if self.project.kind != "bf" or self.project.path is None:
+            return False
+        return self.project.path.name.upper() in {"WW_FULL_GAME_WINDOWS.BF", "WW_DEMO_XBOX.BF"}
+
     def scan_materials(self) -> None:
         asset = self._selected_asset()
         if asset is None:
-            messagebox.showinfo("Material Swap", "Seleziona prima un asset .wow/.bin/.gao nel browser.")
+            messagebox.showinfo("Material Editor", "Seleziona prima un asset .wow/.bin/.gao nel browser.")
             return
         try:
+            self.status.set("Material Editor: indicizzazione texture dell’archivio…")
+            self.update_idletasks()
+            inventory = self._collect_material_texture_inventory(asset)
             data = self.project.read_asset(asset)
-            records = _scan_pop_material_records(data)
+            records = _scan_pop_material_records(data, set(inventory))
+            ww_normal_maps = self._is_ww_normal_map_archive()
+            for info in records.values():
+                # A second material stage is generic (detail, light, mask…);
+                # only the known Warrior Within BF variants treat it as normal.
+                info.normal_key = info.secondary_key if ww_normal_maps else None
             packs, _materials = _scan_pop_materials(data)
-            textures = _scan_pop_textures(data)
             meshes = _scan_pop_meshes(data)
             _associate_mesh_material_packs(data, meshes)
-            by_key = {tex.key: tex for tex in textures}
-            from PIL import Image
-            images = {}
-            for tex in textures:
-                try:
-                    if tex.texture_type == 7:
-                        blob = _dds_blob_for_dump(data, tex)
-                    elif tex.texture_type == 0:
-                        blob = _build_tga_header(tex.storage_width, tex.storage_height, 32) + data[tex.data_offset:tex.data_offset + tex.storage_width * tex.storage_height * 4]
-                    elif tex.texture_type == 1:
-                        continue
-                    else:
-                        continue
-                    images[tex.key] = Image.open(io.BytesIO(blob)).convert("RGBA")
-                except Exception:
-                    continue
             for mesh in meshes:
                 pack = packs.get(mesh.material_pack_key, []) if mesh.material_pack_key is not None else []
                 for material_id, _count in mesh.material_ids:
                     if 0 <= material_id < len(pack):
-                        key = pack[material_id]
-                        info = records.get(key)
+                        info = records.get(pack[material_id])
                         if info is not None and mesh.key not in (info.source_meshes or []):
                             info.source_meshes = list(info.source_meshes or []) + [mesh.key]
+            wanted_keys = {key for info in records.values()
+                           for key in (info.texture_key, info.secondary_key, info.normal_key) if key is not None}
+            images: dict[int, object] = {}
+            sources: dict[int, Asset] = {}
+            unresolved = 0
+            for key in wanted_keys:
+                found = inventory.get(key)
+                if found is None:
+                    unresolved += 1
+                    continue
+                texture_asset, texture_data, texture = found
+                sources[key] = texture_asset
+                try:
+                    images[key] = _decode_pop_texture_image(texture_data, texture)
+                except Exception as exc:
+                    self._log(f"WARN  Texture preview 0x{key:08X}: {exc}")
             self._material_data = bytearray(data)
             self._material_original = bytes(data)
             self._material_dirty = False
             self._material_infos = list(records.values())
             self._material_source_asset = asset
             self._material_textures = images
-            self._material_diffuse_combo_values = []
+            self._material_texture_sources = sources
+            self._material_diffuse_combo_values = [f"0x{key:08X}" for key in sorted(inventory)]
             self._clear_tree(self.material_tree)
             for i, info in enumerate(self._material_infos):
-                diff = f"0x{info.texture_key:08X}" if info.texture_key is not None else "<none>"
+                diffuse = f"0x{info.texture_key:08X}" if info.texture_key is not None else "<none>"
+                secondary = f"0x{info.secondary_key:08X}" if info.secondary_key is not None else "<none>"
                 self.material_tree.insert("", "end", iid=f"mat_{i}",
-                                          values=(f"0x{info.material_key:08X}", diff, "<slot>",
+                                          values=(f"0x{info.material_key:08X}", diffuse, secondary,
                                                   f"{info.alpha:.2f}", f"{info.metallic:.2f}"))
-                self._material_diffuse_combo_values.append(diff)
             self.material_diffuse_combo["values"] = self._material_diffuse_combo_values
-            self.material_source_label.config(text=f"{asset.name} — {len(self._material_infos)} materiali, {len(images)} texture preview")
+            source_note = " • WW normal maps enabled" if ww_normal_maps else " • secondary layers are not normal maps"
+            missing_note = f" • {unresolved} key non trovate" if unresolved else ""
+            self.material_source_label.config(text=(f"{asset.name} — {len(self._material_infos)} materiali, "
+                                                   f"{len(images)}/{len(wanted_keys)} texture preview da {len(inventory)} texture BF"
+                                                   f"{source_note}{missing_note}"))
             self.tabs.select(self.material_tab)
             if self._material_infos:
                 self.material_tree.selection_set("mat_0")
                 self.material_tree.focus("mat_0")
                 self.on_material_selected()
-            self._log(f"OK    Material scan: {asset.name} -> {len(self._material_infos)} materiali")
+            self.status.set("Ready")
+            self._log(f"OK    Material scan: {asset.name} -> {len(self._material_infos)} materiali, {len(images)} texture risolte nel BF")
         except Exception as exc:
+            self.status.set("Ready")
             self._log(f"ERROR Material scan: {exc}")
-            messagebox.showerror("Material Swap", str(exc))
+            messagebox.showerror("Material Editor", str(exc))
 
     def _selected_material(self) -> MaterialInfo | None:
         selection = self.material_tree.selection()
@@ -3064,15 +3244,22 @@ class JadeToolkit(tk.Tk):
 
     def on_material_selected(self, _event=None) -> None:
         info = self._selected_material()
-        if info is None: return
+        if info is None:
+            return
         self._material_metallic.set(info.metallic)
         self._material_alpha.set(info.alpha)
         current = f"0x{info.texture_key:08X}" if info.texture_key is not None else "<none>"
         values = list(self.material_diffuse_combo["values"])
         self.material_diffuse_combo.set(current if current in values else "")
-        self._material_normal_path.set("")
-        self.material_info.config(text=(f"Material 0x{info.material_key:08X} • versioned Jade type-5 record\n"
-                                        f"Diffuse: {current} • source meshes: {len(info.source_meshes or [])}"))
+        secondary = f"0x{info.secondary_key:08X}" if info.secondary_key is not None else ""
+        normal = f"0x{info.normal_key:08X}" if info.normal_key is not None else ""
+        self._material_secondary_path.set(secondary)
+        self._material_normal_path.set(normal)
+        layout = f"Jade kind {info.material_kind}" if info.material_kind is not None else "POP type-5"
+        normal_note = normal or ("<not used outside WW_FULL_GAME_windows / WW_DEMO_xbox>" if secondary else "<none>")
+        self.material_info.config(text=(f"Material 0x{info.material_key:08X} • {layout}\n"
+                                        f"Diffuse: {current} • Secondary: {secondary or '<none>'} • Normal: {normal_note}\n"
+                                        f"Source meshes: {len(info.source_meshes or [])}"))
         self._material_preview_changed()
 
     def _material_preview_changed(self, *_args) -> None:
@@ -3088,9 +3275,44 @@ class JadeToolkit(tk.Tk):
             try: image = self._material_textures.get(int(selected, 16))
             except ValueError: pass
             self.material_canvas.set_image(image)
-            self.material_info.config(text=(f"Material 0x{info.material_key:08X} • versioned Jade type-5 record\n"
+            self.material_info.config(text=(f"Material 0x{info.material_key:08X} • Jade material record\n"
                                              f"Diffuse: {selected or '<none>'} • source meshes: {len(info.source_meshes or [])}\n"
-                                             "Alpha is preview-only; Jade type-5 stores diffuse/specular intensities, not a standalone alpha scalar."))
+                                             "Opacity and specular exponent are written back to the selected Jade material."))
+
+    def _open_material_texture(self, slot: str) -> None:
+        info = self._selected_material()
+        if info is None or self._material_source_asset is None:
+            messagebox.showinfo("Texture Editor", "Seleziona prima un materiale.")
+            return
+        key_by_slot = {"diffuse": info.texture_key, "secondary": info.secondary_key, "normal": info.normal_key}
+        labels = {"diffuse": "texture diffuse", "secondary": "texture secondaria", "normal": "normal map"}
+        key = key_by_slot.get(slot)
+        if key is None:
+            messagebox.showinfo("Texture Editor", f"Questo materiale non ha una {labels.get(slot, 'texture')}.")
+            return
+        texture_asset = self._material_texture_sources.get(key)
+        if texture_asset is None:
+            messagebox.showwarning("Texture Editor", f"Texture 0x{key:08X} non trovata nell’archivio BF.")
+            return
+        previous = self.asset_tree.selection()
+        try:
+            target_iid = next((iid for iid, candidate in self._asset_map.items() if candidate.index == texture_asset.index), None)
+            if target_iid is None:
+                raise RuntimeError("Asset texture non disponibile nell’elenco filtrato.")
+            self.asset_tree.selection_set(target_iid)
+            self.scan_textures()
+        finally:
+            if previous:
+                self.asset_tree.selection_set(previous)
+        match = next((i for i, tex in enumerate(self._texture_infos) if tex.key == key), None)
+        if match is None:
+            messagebox.showwarning("Texture Editor", f"Texture 0x{key:08X} non trovata nell’entry selezionata.")
+            return
+        iid = f"tex_{match}"
+        self.texture_tree.selection_set(iid)
+        self.texture_tree.focus(iid)
+        self.texture_tree.see(iid)
+        self.on_texture_selected()
 
     def choose_material_normal(self) -> None:
         path = filedialog.askopenfilename(title="Choose normal map", filetypes=[
@@ -3110,9 +3332,15 @@ class JadeToolkit(tk.Tk):
                 if selected.startswith("0x"):
                     struct.pack_into("<I", self._material_data, info.texture_offset, int(selected, 16))
                     info.texture_key = int(selected, 16)
-            if info.specular_offset is not None:
-                struct.pack_into("<f", self._material_data, info.specular_offset, float(self._material_metallic.get()))
-                info.metallic = float(self._material_metallic.get())
+            specular_offset = info.specular_exponent_offset or info.specular_offset
+            if specular_offset is not None:
+                value = float(self._material_metallic.get())
+                struct.pack_into("<f", self._material_data, specular_offset, value)
+                info.specular_exponent = info.metallic = value
+            if info.opacity_offset is not None:
+                opacity = float(self._material_alpha.get())
+                struct.pack_into("<f", self._material_data, info.opacity_offset, opacity)
+                info.opacity = info.alpha = opacity
             self._material_dirty = self._material_data != bytearray(self._material_original)
             if not self._material_dirty:
                 messagebox.showinfo("Material Swap", "Nessuna modifica del materiale da salvare.")
