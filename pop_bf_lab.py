@@ -10,9 +10,13 @@ import os
 import re
 import struct
 import math
+import base64
+import json
 import subprocess
 import tempfile
 import ctypes
+import threading
+import queue
 import io
 import shutil
 import sys
@@ -160,6 +164,18 @@ class MaterialInfo:
     material_kind: int | None = None
 
 
+def _jade_color_rgba(value: int) -> tuple[float, float, float, float]:
+    """Convert the D3DCOLOR-style values stored by Jade to OpenGL RGBA."""
+    if value in (0, 0x00000000):
+        return (1.0, 1.0, 1.0, 1.0)
+    return (
+        ((value >> 16) & 0xFF) / 255.0,
+        ((value >> 8) & 0xFF) / 255.0,
+        (value & 0xFF) / 255.0,
+        ((value >> 24) & 0xFF) / 255.0,
+    )
+
+
 if OpenGLFrame is not None:
     class MeshViewport(OpenGLFrame):
         """GPU mesh viewport embedded directly in Tkinter."""
@@ -170,6 +186,8 @@ if OpenGLFrame is not None:
             self.mesh = None
             self.textures = {}
             self.texture_ids = {}
+            self.material_textures = {}
+            self.material_colors = {}
             self.yaw = -0.55
             self.pitch = 0.20
             self.distance = 3.2
@@ -219,9 +237,14 @@ if OpenGLFrame is not None:
                 self.tkMakeCurrent()
                 self._apply_projection()
 
-        def set_scene(self, mesh, textures):
+        def set_scene(self, mesh, textures, material_textures=None, material_colors=None):
             self.mesh = mesh
             self.textures = textures or {}
+            # Material IDs are local to a mesh/material-pack. Keeping this
+            # lookup in the viewport prevents an ID in another mesh's pack
+            # from selecting the wrong texture.
+            self.material_textures = material_textures or {}
+            self.material_colors = material_colors or {}
             self._release_textures()
             if mesh and mesh.vertices:
                 xs = [v[0] for v in mesh.vertices]; ys = [v[1] for v in mesh.vertices]; zs = [v[2] for v in mesh.vertices]
@@ -260,7 +283,7 @@ if OpenGLFrame is not None:
             self.texture_ids[key] = tex_id
             return tex_id
 
-        def _draw_mesh(self, vertices, faces, uvs, uv_indices, material_ids):
+        def _draw_mesh(self, vertices, faces, uvs, uv_indices, material_ids, normals=None):
             if not vertices or not faces:
                 return
             face_materials = [0] * len(faces)
@@ -273,19 +296,23 @@ if OpenGLFrame is not None:
                 if len(face) != 3 or any(i < 0 or i >= len(vertices) for i in face):
                     continue
                 mat_id = face_materials[face_index] if face_index < len(face_materials) else 0
-                tex_key = self.owner._mesh_material_textures.get(mat_id)
+                tex_key = self.material_textures.get(mat_id)
                 tex_id = self._upload_texture(tex_key, self.textures.get(tex_key)) if tex_key is not None else None
+                red, green, blue, alpha = self.material_colors.get(mat_id, (0.68, 0.72, 0.80, 1.0))
                 if tex_id:
                     GL.glEnable(GL.GL_TEXTURE_2D); GL.glBindTexture(GL.GL_TEXTURE_2D, tex_id)
-                    GL.glColor4f(1, 1, 1, 1)
+                    GL.glColor4f(red, green, blue, alpha)
                 else:
-                    GL.glDisable(GL.GL_TEXTURE_2D); GL.glColor4f(0.68, 0.72, 0.80, 1)
+                    GL.glDisable(GL.GL_TEXTURE_2D); GL.glColor4f(red, green, blue, alpha)
                 GL.glBegin(GL.GL_TRIANGLES)
                 for corner, vi in enumerate(face):
                     if uv_indices and face_index < len(uv_indices) and uvs:
                         ui = uv_indices[face_index][corner]
                         if 0 <= ui < len(uvs):
                             GL.glTexCoord2f(float(uvs[ui][0]), 1.0 - float(uvs[ui][1]))
+                    if normals and 0 <= vi < len(normals):
+                        nx, ny, nz = normals[vi]
+                        GL.glNormal3f(float(nx), float(ny), float(nz))
                     x, y, z = vertices[vi]
                     GL.glVertex3f(float(x), float(y), float(z))
                 GL.glEnd()
@@ -304,11 +331,11 @@ if OpenGLFrame is not None:
             if self.mesh:
                 GL.glPushMatrix()
                 GL.glTranslatef(-self.target[0], -self.target[1], -self.target[2])
-                self._draw_mesh(self.mesh.vertices, self.mesh.faces, self.mesh.uvs, self.mesh.uv_indices, self.mesh.material_ids)
+                self._draw_mesh(self.mesh.vertices, self.mesh.faces, self.mesh.uvs, self.mesh.uv_indices, self.mesh.material_ids, self.mesh.normals)
                 if self.mesh.second_vertices and self.mesh.second_faces:
                     self._draw_mesh(self.mesh.second_vertices, self.mesh.second_faces,
                                     self.mesh.second_uvs or [], self.mesh.second_uv_indices or [],
-                                    self.mesh.second_material_ids or self.mesh.material_ids)
+                                    self.mesh.second_material_ids or self.mesh.material_ids, None)
                 GL.glPopMatrix()
             GL.glDisable(GL.GL_TEXTURE_2D)
             GL.glColor3f(0.22, 0.25, 0.30)
@@ -549,14 +576,16 @@ def _scan_pop_meshes(data: bytes) -> list[MeshInfo]:
             version = r.u32()
             if version not in (7, 8):
                 continue
-            flags = r.u32()
-            kb_marker = struct.unpack_from("<I", r.data, r.pos + 4)[0] if r.pos + 8 <= len(r.data) else 0
-            if version == 7 and (flags & 0x8) and kb_marker == 0xC0DE2002:
-                kb = _scan_kindred_blades_packet(r, entry)
-                if kb is not None:
-                    kb.index = len(meshes)
-                    meshes.append(kb)
+            # The PoP3 prototype stores some meshes as an interleaved direct
+            # packet immediately after the version. Its header can be
+            # validated exactly, so try it before the retail split-array
+            # layout without relying on a game/build-specific marker.
+            direct = _scan_pop3_direct_mesh(r, entry, version)
+            if direct is not None:
+                direct.index = len(meshes)
+                meshes.append(direct)
                 continue
+            flags = r.u32()
             has_second_mesh = r.u32() != 0
             num_vertices = r.u32()
             num_unknown = r.u32()
@@ -586,8 +615,10 @@ def _scan_pop_meshes(data: bytes) -> list[MeshInfo]:
             vertices = list(zip(vertex_data[0::3], vertex_data[1::3], vertex_data[2::3]))
             if has_unknown:
                 r.f32s(num_unknown)
+            normals = None
             if has_normals:
-                r.f32s(3 * num_vertices)
+                normal_data = r.f32s(3 * num_vertices)
+                normals = list(zip(normal_data[0::3], normal_data[1::3], normal_data[2::3]))
             uv_data = r.f32s(2 * num_uvs)
             uvs = list(zip(uv_data[0::2], uv_data[1::2]))
 
@@ -667,49 +698,79 @@ def _scan_pop_meshes(data: bytes) -> list[MeshInfo]:
                                    vertices, faces, uvs, uv_indices, material_ids,
                                    second_vertices=second_vertices, second_faces=second_faces,
                                    second_uvs=second_uvs, second_uv_indices=second_uv_indices,
-                                   second_material_ids=second_material_ids))
+                                   second_material_ids=second_material_ids, normals=normals))
         except (ValueError, IndexError, struct.error):
             continue
     return meshes
 
 
-def _scan_kindred_blades_packet(r: _PopReader, entry: PopFileEntry) -> MeshInfo | None:
-    """Recover KB v7 character geometry from its internal vertex packet."""
-    valid_strides = (20, 32, 44, 52, 64)
+def _scan_pop3_direct_mesh(r: _PopReader, entry: PopFileEntry, version: int) -> MeshInfo | None:
+    """Parse the exact interleaved mesh packet used by the PoP3 prototype."""
     start = r.pos
-    for packet_pos in range(start, len(r.data) - 16, 4):
-        try:
-            blob_size, _unknown, vertex_count, stride = struct.unpack_from("<4I", r.data, packet_pos)
-            if stride not in valid_strides or not (1 <= vertex_count <= 100_000):
-                continue
-            vertex_offset = packet_pos + 16
-            vertex_end = vertex_offset + vertex_count * stride
-            if blob_size != vertex_count * stride + 8 or vertex_end + 4 > len(r.data):
-                continue
-            face_size = struct.unpack_from("<I", r.data, vertex_end)[0]
-            face_end = vertex_end + 4 + face_size
-            if face_size < 6 or face_size % 6 or face_end > len(r.data):
-                continue
-            indices = struct.unpack_from("<" + "h" * (face_size // 2), r.data, vertex_end + 4)
-            if not indices or any(i < 0 or i >= vertex_count for i in indices):
-                continue
-            vertices: list[tuple[float, float, float]] = []
-            uvs: list[tuple[float, float]] = []
-            p = vertex_offset
-            for _ in range(vertex_count):
-                x, y, z = struct.unpack_from("<3f", r.data, p)
-                vertices.append((x, y, z))
-                if stride == 20:
-                    uv = struct.unpack_from("<2f", r.data, p + 12)
-                else:
-                    uv = struct.unpack_from("<2f", r.data, p + 24)
-                uvs.append(uv)
-                p += stride
-            faces = [tuple(indices[i:i + 3]) for i in range(0, len(indices), 3)]
-            return MeshInfo(-1, entry.key, entry.index, 7, vertices, faces, uvs, [], [])
-        except (ValueError, struct.error):
-            continue
-    return None
+    valid_strides = (20, 32, 44, 52, 64)
+    try:
+        if start + 16 > len(r.data):
+            return None
+        _flags, _unknown1, _unknown2, material_count = struct.unpack_from("<4I", r.data, start)
+        if not (1 <= material_count <= 256):
+            return None
+
+        pos = start + 16
+        material_ids: list[tuple[int, int]] = []
+        face_count = 0
+        for _ in range(material_count):
+            if pos + 8 > len(r.data):
+                return None
+            material_id, count = struct.unpack_from("<iI", r.data, pos)
+            pos += 8
+            if count > 1_000_000:
+                return None
+            material_ids.append((material_id, count))
+            face_count += count
+        if face_count == 0 or face_count > 2_000_000 or pos + 16 > len(r.data):
+            return None
+
+        blob_size, _unknown3, vertex_count, stride = struct.unpack_from("<4I", r.data, pos)
+        if stride not in valid_strides or not (1 <= vertex_count <= 500_000):
+            return None
+        vertex_offset = pos + 16
+        vertex_end = vertex_offset + vertex_count * stride
+        if blob_size != vertex_count * stride + 8 or vertex_end + 4 > len(r.data):
+            return None
+
+        face_size = struct.unpack_from("<I", r.data, vertex_end)[0]
+        if face_size == 0 or face_size % 6 or face_size // 6 != face_count:
+            return None
+        face_end = vertex_end + 4 + face_size
+        if face_end > len(r.data):
+            return None
+        indices = struct.unpack_from("<" + "H" * (face_size // 2), r.data, vertex_end + 4)
+        if any(index >= vertex_count for index in indices):
+            return None
+
+        vertices: list[tuple[float, float, float]] = []
+        normals: list[tuple[float, float, float]] | None = [] if stride != 20 else None
+        uvs: list[tuple[float, float]] = []
+        uv_offset = 12 if stride == 20 else (44 if stride in (52, 64) else 24)
+        for vertex_index in range(vertex_count):
+            vertex_pos = vertex_offset + vertex_index * stride
+            vertex = struct.unpack_from("<3f", r.data, vertex_pos)
+            uv = struct.unpack_from("<2f", r.data, vertex_pos + uv_offset)
+            if not all(math.isfinite(value) for value in (*vertex, *uv)):
+                return None
+            vertices.append(vertex)
+            uvs.append(uv)
+            if normals is not None:
+                normal = struct.unpack_from("<3f", r.data, vertex_pos + 12)
+                if not all(math.isfinite(value) for value in normal):
+                    return None
+                normals.append(normal)
+
+        faces = [tuple(indices[i:i + 3]) for i in range(0, len(indices), 3)]
+        return MeshInfo(-1, entry.key, entry.index, version, vertices, faces, uvs,
+                        list(faces), material_ids, normals=normals)
+    except (ValueError, struct.error):
+        return None
 
 
 def _scan_pop_materials(data: bytes) -> tuple[dict[int, list[int]], dict[int, int]]:
@@ -893,32 +954,47 @@ def _scan_pop_material_records(data: bytes, valid_texture_keys: set[int] | None 
 def _associate_mesh_material_packs(data: bytes, meshes: list[MeshInfo]) -> None:
     """Use .gao records to associate mesh hashes with their material packs."""
     by_mesh = {m.key: m for m in meshes}
-    for entry in _parse_pop_file_entries(data):
-        blob = data[entry.data_offset:entry.data_offset + entry.size]
-        if len(blob) < 20 or struct.unpack_from("<I", blob, 0)[0] != 0x6F616F2E:
+    entries = _parse_pop_file_entries(data)
+    by_key = {entry.key: entry for entry in entries}
+
+    def assign_visual(gro_key: int, grm_key: int, name: str) -> None:
+        direct = by_mesh.get(gro_key)
+        if direct is not None:
+            direct.material_pack_key = grm_key
+            direct.object_name = name
+            return
+        # GAO can point to a geometry group instead of a type-1 mesh.
+        # Resolve every mesh key stored by the group, as MeshSwap.cpp does.
+        group = by_key.get(gro_key)
+        if group is None or group.data_type == 1:
+            return
+        payload = data[group.data_offset + 4:group.data_offset + group.size]
+        seen: set[int] = set()
+        for offset in range(0, len(payload) - 3):
+            candidate = struct.unpack_from("<I", payload, offset)[0]
+            mesh = by_mesh.get(candidate)
+            if mesh is not None and candidate not in seen:
+                mesh.material_pack_key = grm_key
+                mesh.object_name = name
+                seen.add(candidate)
+
+    for entry in entries:
+        if entry.data_type != struct.unpack("<I", b".gao")[0] or entry.size < 24:
             continue
         try:
-            r = _PopReader(blob)
-            r.u32(); r.u32(); flags = r.u32(); r.u32()
-            name_len = r.u32()
-            if name_len <= 0 or name_len > 4096 or r.pos + name_len > len(blob):
+            # The FileEntry's first dword is '.gao'; Gao.cpp consumes it as
+            # the type before deserialising this payload.
+            payload = data[entry.data_offset + 4:entry.data_offset + entry.size]
+            _version, _editor_flags, identity, name_len = struct.unpack_from("<4I", payload, 0)
+            if name_len > 4096 or 16 + name_len > len(payload):
                 continue
-            name = blob[r.pos:r.pos + name_len].rstrip(b"\0").decode("latin-1", errors="replace")
-            r.pos += name_len
-            r.u32(); r.u16(); r.f32(); r.f32s(3); r.f32(); r.f32s(3); r.f32(); r.f32s(3); r.f32(); r.f32s(3)
-            if flags & 0x10000:
-                r.u32()
-            else:
-                r.f32()
-            r.u32()
-            if flags & 0x80000:
-                r.f32s(6)
-            r.f32s(6)
-            if flags & 0x4000:
-                mesh_key = r.u32(); pack_key = r.u32()
-                if mesh_key in by_mesh:
-                    by_mesh[mesh_key].material_pack_key = pack_key
-                    by_mesh[mesh_key].object_name = name
+            name = payload[16:16 + name_len].rstrip(b"\0").decode("latin-1", errors="replace")
+            matrix_offset = 16 + name_len + 10
+            bounds_size = 48 if identity & 0x00080000 else 24
+            visual_offset = matrix_offset + 68 + bounds_size
+            if identity & 0x00004000 and visual_offset + 8 <= len(payload):
+                gro_key, grm_key = struct.unpack_from("<II", payload, visual_offset)
+                assign_visual(gro_key, grm_key, name)
         except (ValueError, struct.error):
             continue
 
@@ -1021,6 +1097,203 @@ def _decode_pop_texture_image(data: bytes, tex: TextureInfo):
     return Image.open(io.BytesIO(blob)).convert("RGBA")
 
 
+
+def _read_glb_for_mesh_swap(path: Path) -> tuple[dict, list[bytes]]:
+    """Read the self-contained GLB contract used by Jade Toolkit's mesh swap."""
+    raw = path.read_bytes()
+    if len(raw) < 20 or raw[:4] != b"glTF":
+        raise ValueError("Mesh Swap richiede un GLB binario glTF 2.0.")
+    _magic, version, declared_size = struct.unpack_from("<4sII", raw, 0)
+    if version != 2 or declared_size > len(raw):
+        raise ValueError("GLB non valido o non completamente disponibile.")
+    pos = 12
+    document = None
+    buffers: list[bytes] = []
+    while pos + 8 <= declared_size:
+        length, kind = struct.unpack_from("<I4s", raw, pos)
+        pos += 8
+        if pos + length > declared_size:
+            raise ValueError("Chunk GLB oltre la fine del file.")
+        chunk = raw[pos:pos + length]
+        pos += length
+        if kind == b"JSON":
+            document = json.loads(chunk.decode("utf-8").rstrip())
+        elif kind == b"BIN\0":
+            buffers.append(chunk)
+    if not isinstance(document, dict) or not buffers:
+        raise ValueError("Il GLB deve contenere JSON e buffer binario.")
+    return document, buffers
+
+
+def _glb_accessor_values(document: dict, buffers: list[bytes], accessor_index: int) -> list[tuple[float, ...]]:
+    """Decode a non-sparse glTF accessor with its byte stride respected."""
+    accessors = document.get("accessors", [])
+    views = document.get("bufferViews", [])
+    if not (0 <= accessor_index < len(accessors)):
+        raise ValueError(f"Accessor GLB {accessor_index} non trovato.")
+    accessor = accessors[accessor_index]
+    if "sparse" in accessor:
+        raise ValueError("Accessor GLB sparse non ancora supportati.")
+    view_index = accessor.get("bufferView")
+    if not isinstance(view_index, int) or not (0 <= view_index < len(views)):
+        raise ValueError("Accessor GLB senza bufferView valido.")
+    view = views[view_index]
+    buffer_index = view.get("buffer", 0)
+    if not isinstance(buffer_index, int) or not (0 <= buffer_index < len(buffers)):
+        raise ValueError("Buffer GLB non disponibile.")
+    component_type = accessor.get("componentType")
+    component_formats = {
+        5120: ("b", 1), 5121: ("B", 1), 5122: ("h", 2),
+        5123: ("H", 2), 5125: ("I", 4), 5126: ("f", 4),
+    }
+    if component_type not in component_formats:
+        raise ValueError(f"Tipo componente GLB {component_type} non supportato.")
+    components = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}.get(accessor.get("type"))
+    count = accessor.get("count")
+    if components is None or not isinstance(count, int) or count < 0:
+        raise ValueError("Accessor GLB con type/count non valido.")
+    fmt, component_size = component_formats[component_type]
+    element_size = component_size * components
+    stride = view.get("byteStride", element_size)
+    if not isinstance(stride, int) or stride < element_size:
+        raise ValueError("byteStride GLB non valido.")
+    offset = int(view.get("byteOffset", 0)) + int(accessor.get("byteOffset", 0))
+    data = buffers[buffer_index]
+    if offset < 0 or count and offset + (count - 1) * stride + element_size > len(data):
+        raise ValueError("Accessor GLB oltre il buffer.")
+    normalized = bool(accessor.get("normalized", False))
+    limits = {5120: 127.0, 5121: 255.0, 5122: 32767.0, 5123: 65535.0, 5125: 4294967295.0}
+    values: list[tuple[float, ...]] = []
+    for item in range(count):
+        decoded = struct.unpack_from("<" + fmt * components, data, offset + item * stride)
+        if normalized and component_type != 5126:
+            if component_type in (5120, 5122):
+                decoded = tuple(max(-1.0, value / limits[component_type]) for value in decoded)
+            else:
+                decoded = tuple(value / limits[component_type] for value in decoded)
+        values.append(tuple(float(value) for value in decoded))
+    return values
+
+
+def _glb_image(document: dict, buffers: list[bytes], image_index: int, source_path: Path):
+    """Load an embedded, data-URI or sidecar glTF image for the preview."""
+    from PIL import Image
+    images = document.get("images", [])
+    if not (0 <= image_index < len(images)):
+        return None
+    image = images[image_index]
+    payload = None
+    if isinstance(image.get("uri"), str):
+        uri = image["uri"]
+        if uri.startswith("data:"):
+            try:
+                payload = base64.b64decode(uri.split(",", 1)[1])
+            except (IndexError, ValueError) as exc:
+                raise ValueError("Data URI texture GLB non valida.") from exc
+        else:
+            candidate = (source_path.parent / uri).resolve()
+            if candidate.is_file():
+                payload = candidate.read_bytes()
+    elif isinstance(image.get("bufferView"), int):
+        views = document.get("bufferViews", [])
+        view_index = image["bufferView"]
+        if 0 <= view_index < len(views):
+            view = views[view_index]
+            buffer_index = view.get("buffer", 0)
+            if 0 <= buffer_index < len(buffers):
+                begin = int(view.get("byteOffset", 0))
+                end = begin + int(view.get("byteLength", 0))
+                payload = buffers[buffer_index][begin:end]
+    return Image.open(io.BytesIO(payload)).convert("RGBA") if payload else None
+
+
+def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], dict[int, int], dict[int, tuple[float, float, float, float]]]:
+    """Import a GLB preview in Jade axes, retaining primitive/material boundaries."""
+    document, buffers = _read_glb_for_mesh_swap(path)
+    meshes = document.get("meshes", [])
+    if not meshes:
+        raise ValueError("Il GLB non contiene mesh.")
+    mesh_document = meshes[0]
+    primitives = mesh_document.get("primitives", [])
+    if not primitives:
+        raise ValueError("La mesh GLB non contiene primitive.")
+    materials = document.get("materials", [])
+    textures = document.get("textures", [])
+    vertices: list[tuple[float, float, float]] = []
+    normals: list[tuple[float, float, float]] = []
+    uvs: list[tuple[float, float]] = []
+    faces: list[tuple[int, int, int]] = []
+    uv_indices: list[tuple[int, int, int]] = []
+    material_ids: list[tuple[int, int]] = []
+    preview_images: dict[int, object] = {}
+    material_textures: dict[int, int] = {}
+    material_colors: dict[int, tuple[float, float, float, float]] = {}
+
+    for primitive_index, primitive in enumerate(primitives):
+        if primitive.get("mode", 4) != 4:
+            continue
+        attrs = primitive.get("attributes", {})
+        position_accessor = attrs.get("POSITION")
+        if not isinstance(position_accessor, int):
+            continue
+        positions = _glb_accessor_values(document, buffers, position_accessor)
+        if not positions:
+            continue
+        texcoords = _glb_accessor_values(document, buffers, attrs["TEXCOORD_0"]) if isinstance(attrs.get("TEXCOORD_0"), int) else []
+        imported_normals = _glb_accessor_values(document, buffers, attrs["NORMAL"]) if isinstance(attrs.get("NORMAL"), int) else []
+        indices = (_glb_accessor_values(document, buffers, primitive["indices"])
+                   if isinstance(primitive.get("indices"), int)
+                   else [(float(index),) for index in range(len(positions))])
+        if len(indices) % 3:
+            raise ValueError(f"Primitiva GLB {primitive_index} non triangolare.")
+        vertex_start = len(vertices)
+        uv_start = len(uvs)
+        for position in positions:
+            if len(position) < 3:
+                raise ValueError("POSITION GLB non VEC3.")
+            vertices.append((position[0], -position[2], position[1]))
+        for normal in imported_normals:
+            if len(normal) >= 3:
+                normals.append((normal[0], -normal[2], normal[1]))
+        if len(normals) < len(vertices):
+            normals.extend([(0.0, 0.0, 1.0)] * (len(vertices) - len(normals)))
+        uvs.extend((uv[0], uv[1]) if len(uv) >= 2 else (0.0, 0.0) for uv in texcoords)
+        if len(uvs) < uv_start + len(positions):
+            uvs.extend([(0.0, 0.0)] * (uv_start + len(positions) - len(uvs)))
+        primitive_faces = 0
+        for offset in range(0, len(indices), 3):
+            local = tuple(int(indices[offset + corner][0]) for corner in range(3))
+            if any(index < 0 or index >= len(positions) for index in local):
+                raise ValueError(f"Indice fuori range nella primitiva GLB {primitive_index}.")
+            faces.append(tuple(vertex_start + index for index in local))
+            uv_indices.append(tuple(uv_start + index for index in local))
+            primitive_faces += 1
+        material_id = int(primitive.get("material", primitive_index))
+        material_ids.append((material_id, primitive_faces))
+        material = materials[material_id] if 0 <= material_id < len(materials) else {}
+        pbr = material.get("pbrMetallicRoughness", {}) if isinstance(material, dict) else {}
+        factor = pbr.get("baseColorFactor", [1.0, 1.0, 1.0, 1.0]) if isinstance(pbr, dict) else [1.0, 1.0, 1.0, 1.0]
+        if not isinstance(factor, list):
+            factor = [1.0, 1.0, 1.0, 1.0]
+        factor = (factor + [1.0, 1.0, 1.0, 1.0])[:4]
+        material_colors[material_id] = tuple(max(0.0, min(1.0, float(value))) for value in factor)
+        texture_info = pbr.get("baseColorTexture", {}) if isinstance(pbr, dict) else {}
+        texture_index = texture_info.get("index") if isinstance(texture_info, dict) else None
+        if isinstance(texture_index, int) and 0 <= texture_index < len(textures):
+            image_index = textures[texture_index].get("source")
+            if isinstance(image_index, int):
+                image = _glb_image(document, buffers, image_index, path)
+                if image is not None:
+                    texture_key = 0xF0000000 | (image_index & 0x0FFFFFFF)
+                    preview_images[texture_key] = image
+                    material_textures[material_id] = texture_key
+
+    if not faces:
+        raise ValueError("Nessuna primitiva triangolare importabile nel GLB.")
+    label = mesh_document.get("name") if isinstance(mesh_document, dict) else None
+    mesh = MeshInfo(0, 0, -1, 0, vertices, faces, uvs, uv_indices, material_ids,
+                    object_name=str(label or path.stem), normals=normals)
+    return mesh, preview_images, material_textures, material_colors
 def _dds_payload_and_info(path: Path) -> tuple[bytes, int, int, str, bytes]:
     """Read a standard DDS and return compressed payload plus dimensions/format."""
     raw = path.read_bytes()
@@ -2643,12 +2916,34 @@ class JadeToolkit(tk.Tk):
         self._mesh_source_asset: Asset | None = None
         self._mesh_textures: dict[int, object] = {}
         self._mesh_material_textures: dict[int, int] = {}
+        self._mesh_material_textures_by_mesh: dict[int, dict[int, int]] = {}
+        self._mesh_material_colors_by_mesh: dict[int, dict[int, tuple[float, float, float, float]]] = {}
+        self._swap_mesh: MeshInfo | None = None
+        self._swap_mesh_textures: dict[int, object] = {}
+        self._swap_mesh_material_textures: dict[int, int] = {}
+        self._swap_mesh_material_colors: dict[int, tuple[float, float, float, float]] = {}
+        self._swap_mesh_path: Path | None = None
         self._mesh_texture_photos: list[object] = []
+        self._mesh_external_texture_cache: dict[int, object] = {}
+        self._mesh_external_texture_misses: set[int] = set()
+        self._mesh_cache_project: Path | None = None
+        self._mesh_pending_texture_keys: set[int] = set()
+        self._mesh_texture_search_queue: queue.Queue = queue.Queue()
+        self._mesh_texture_search_generation = 0
+
         self._material_data = bytearray()
         self._material_infos: list[MaterialInfo] = []
         self._material_source_asset: Asset | None = None
         self._material_textures: dict[int, object] = {}
         self._material_texture_sources: dict[int, Asset] = {}
+        self._material_inventory_sources: dict[int, Asset] = {}
+        self._material_external_texture_cache: dict[int, object] = {}
+        self._material_texture_decode_misses: set[int] = set()
+        self._material_inventory_complete = False
+        self._material_cache_project: Path | None = None
+        self._material_index_queue: queue.Queue = queue.Queue()
+        self._material_index_generation = 0
+
         self._material_texture_photos: list[object] = []
         self._material_diffuse_path = tk.StringVar()
         self._material_secondary_path = tk.StringVar()
@@ -3005,6 +3300,7 @@ class JadeToolkit(tk.Tk):
         top.pack(fill="x")
         ttk.Label(top, text="Mesh Editor", font=("TkDefaultFont", 14, "bold")).pack(side="left")
         ttk.Button(top, text="Scan selected .wow / asset", command=self.scan_meshes).pack(side="right")
+        ttk.Button(top, text="Import replacement GLB...", command=self.import_swap_mesh).pack(side="right", padx=6)
         ttk.Button(top, text="Export mesh", command=self.export_mesh).pack(side="right", padx=6)
         self.mesh_source_label = ttk.Label(self.mesh_tab, text="Nessun mesh analizzato")
         self.mesh_source_label.pack(anchor="w", pady=(4, 8))
@@ -3024,11 +3320,17 @@ class JadeToolkit(tk.Tk):
         self.mesh_tree.pack(fill="both", expand=True, pady=(5, 0))
         self.mesh_tree.bind("<<TreeviewSelect>>", self.on_mesh_selected)
 
-        preview_box = ttk.LabelFrame(right, text="Mesh 3D selezionato", padding=6)
-        preview_box.pack(fill="both", expand=True)
+        preview_split = ttk.Panedwindow(right, orient="vertical")
+        preview_split.pack(fill="both", expand=True)
+        preview_box = ttk.LabelFrame(preview_split, text="Mesh 3D selezionato", padding=6)
+        replacement_box = ttk.LabelFrame(preview_split, text="Mesh importato per la sostituzione", padding=6)
+        preview_split.add(preview_box, weight=1)
+        preview_split.add(replacement_box, weight=1)
         if OpenGLFrame is not None:
             self.mesh_canvas = MeshViewport(preview_box, self, highlightthickness=0, bd=0)
             self.mesh_canvas.pack(fill="both", expand=True)
+            self.swap_mesh_canvas = MeshViewport(replacement_box, self, highlightthickness=0, bd=0)
+            self.swap_mesh_canvas.pack(fill="both", expand=True)
         else:
             self.mesh_canvas = tk.Canvas(preview_box, bg=self._dark["field"], highlightthickness=0, cursor="hand2")
             self.mesh_canvas.pack(fill="both", expand=True)
@@ -3039,6 +3341,10 @@ class JadeToolkit(tk.Tk):
             self.mesh_canvas.bind("<Button-4>", lambda e: self._mesh_zoom_by(1.1))
             self.mesh_canvas.bind("<Button-5>", lambda e: self._mesh_zoom_by(1 / 1.1))
             self.mesh_canvas.bind("<Configure>", lambda _e: self._schedule_mesh_render())
+            self.swap_mesh_canvas = tk.Label(replacement_box, text="OpenGL non disponibile", anchor="center")
+            self.swap_mesh_canvas.pack(fill="both", expand=True)
+        self.swap_mesh_info = ttk.Label(replacement_box, text="Importa un GLB per visualizzare la mesh candidata allo swap.", justify="left")
+        self.swap_mesh_info.pack(anchor="w", pady=(6, 0))
 
         info_box = ttk.LabelFrame(right, text="Mesh info", padding=8)
         info_box.pack(fill="x", pady=(8, 0))
@@ -3128,31 +3434,14 @@ class JadeToolkit(tk.Tk):
         self.material_info = ttk.Label(editor, text="Seleziona un materiale per modificarlo.", justify="left")
         self.material_info.pack(anchor="w", pady=(7, 0))
 
-    def _collect_material_texture_inventory(self, preferred_asset: Asset) -> dict[int, tuple[Asset, bytes, TextureInfo]]:
-        """Index physical textures across the opened BF, preferring the largest copy.
-
-        Jade archives commonly keep a material in one entry and its texture in
-        another.  Restricting previews to the selected entry was therefore the
-        main source of white materials in this editor.
-        """
-        assets = [preferred_asset]
-        if self.project.kind == "bf":
-            assets.extend(asset for asset in self.project.assets if asset.index != preferred_asset.index)
+    def _collect_material_texture_inventory(self, preferred_asset: Asset, data: bytes | None = None) -> dict[int, tuple[Asset, bytes, TextureInfo]]:
+        """Index only the selected asset; BF-wide indexing runs in background."""
+        candidate_data = data if data is not None else self.project.read_asset(preferred_asset)
         inventory: dict[int, tuple[Asset, bytes, TextureInfo]] = {}
-        total = len(assets)
-        for position, candidate in enumerate(assets, 1):
-            try:
-                candidate_data = self.project.read_asset(candidate)
-                candidate_textures = _scan_pop_textures(candidate_data)
-            except Exception:
-                continue
-            for texture in candidate_textures:
-                current = inventory.get(texture.key)
-                if current is None or texture.data_end - texture.data_offset > current[2].data_end - current[2].data_offset:
-                    inventory[texture.key] = (candidate, candidate_data, texture)
-            if position == 1 or position == total or position % 25 == 0:
-                self.status.set(f"Material Editor: indicizzazione texture {position}/{total}…")
-                self.update_idletasks()
+        for texture in _scan_pop_textures(candidate_data):
+            current = inventory.get(texture.key)
+            if current is None or texture.data_end - texture.data_offset > current[2].data_end - current[2].data_offset:
+                inventory[texture.key] = (preferred_asset, candidate_data, texture)
         return inventory
 
     def _is_ww_normal_map_archive(self) -> bool:
@@ -3166,74 +3455,268 @@ class JadeToolkit(tk.Tk):
             messagebox.showinfo("Material Editor", "Seleziona prima un asset .wow/.bin/.gao nel browser.")
             return
         try:
-            self.status.set("Material Editor: indicizzazione texture dell’archivio…")
+            self._material_index_generation += 1
+            generation = self._material_index_generation
+            self.status.set("Material Editor: lettura materiali e texture locali...")
             self.update_idletasks()
-            inventory = self._collect_material_texture_inventory(asset)
             data = self.project.read_asset(asset)
-            records = _scan_pop_material_records(data, set(inventory))
+
+            project_path = self.project.path
+            if self._material_cache_project != project_path:
+                self._material_inventory_sources.clear()
+                self._material_external_texture_cache.clear()
+                self._material_texture_decode_misses.clear()
+                self._material_inventory_complete = False
+                self._material_cache_project = project_path
+
+            inventory = self._collect_material_texture_inventory(asset, data)
+            for key in inventory:
+                self._material_inventory_sources[key] = asset
+            known_texture_keys = set(inventory) | set(self._material_inventory_sources)
+            records = _scan_pop_material_records(data, known_texture_keys)
             ww_normal_maps = self._is_ww_normal_map_archive()
             for info in records.values():
-                # A second material stage is generic (detail, light, mask…);
-                # only the known Warrior Within BF variants treat it as normal.
                 info.normal_key = info.secondary_key if ww_normal_maps else None
+
             packs, _materials = _scan_pop_materials(data)
             meshes = _scan_pop_meshes(data)
             _associate_mesh_material_packs(data, meshes)
             for mesh in meshes:
                 pack = packs.get(mesh.material_pack_key, []) if mesh.material_pack_key is not None else []
+                if not pack and mesh.material_pack_key in records:
+                    pack = [mesh.material_pack_key]
                 for material_id, _count in mesh.material_ids:
-                    if 0 <= material_id < len(pack):
-                        info = records.get(pack[material_id])
-                        if info is not None and mesh.key not in (info.source_meshes or []):
-                            info.source_meshes = list(info.source_meshes or []) + [mesh.key]
-            wanted_keys = {key for info in records.values()
-                           for key in (info.texture_key, info.secondary_key, info.normal_key) if key is not None}
+                    if not pack:
+                        continue
+                    pack_index = 0 if material_id < 0 else min(material_id, len(pack) - 1)
+                    info = records.get(pack[pack_index])
+                    if info is not None and mesh.key not in (info.source_meshes or []):
+                        info.source_meshes = list(info.source_meshes or []) + [mesh.key]
+
+            wanted_keys = {
+                key for info in records.values()
+                for key in (info.texture_key, info.secondary_key, info.normal_key)
+                if key not in (None, 0, 0xFFFFFFFF)
+            }
             images: dict[int, object] = {}
-            sources: dict[int, Asset] = {}
-            unresolved = 0
             for key in wanted_keys:
                 found = inventory.get(key)
-                if found is None:
-                    unresolved += 1
-                    continue
-                texture_asset, texture_data, texture = found
-                sources[key] = texture_asset
-                try:
-                    images[key] = _decode_pop_texture_image(texture_data, texture)
-                except Exception as exc:
-                    self._log(f"WARN  Texture preview 0x{key:08X}: {exc}")
+                if found is not None:
+                    _texture_asset, texture_data, texture = found
+                    try:
+                        images[key] = _decode_pop_texture_image(texture_data, texture)
+                    except Exception as exc:
+                        self._log(f"WARN  Texture preview 0x{key:08X}: {exc}")
+                elif key in self._material_external_texture_cache:
+                    images[key] = self._material_external_texture_cache[key]
+
             self._material_data = bytearray(data)
             self._material_original = bytes(data)
             self._material_dirty = False
             self._material_infos = list(records.values())
             self._material_source_asset = asset
             self._material_textures = images
-            self._material_texture_sources = sources
-            self._material_diffuse_combo_values = [f"0x{key:08X}" for key in sorted(inventory)]
+            self._material_texture_sources = dict(self._material_inventory_sources)
+            self._material_diffuse_combo_values = [
+                f"0x{key:08X}" for key in sorted(known_texture_keys)
+            ]
             self._clear_tree(self.material_tree)
             for i, info in enumerate(self._material_infos):
                 diffuse = f"0x{info.texture_key:08X}" if info.texture_key is not None else "<none>"
                 secondary = f"0x{info.secondary_key:08X}" if info.secondary_key is not None else "<none>"
-                self.material_tree.insert("", "end", iid=f"mat_{i}",
-                                          values=(f"0x{info.material_key:08X}", diffuse, secondary,
-                                                  f"{info.alpha:.2f}", f"{info.metallic:.2f}"))
+                self.material_tree.insert(
+                    "", "end", iid=f"mat_{i}",
+                    values=(f"0x{info.material_key:08X}", diffuse, secondary,
+                            f"{info.alpha:.2f}", f"{info.metallic:.2f}")
+                )
             self.material_diffuse_combo["values"] = self._material_diffuse_combo_values
-            source_note = " • WW normal maps enabled" if ww_normal_maps else " • secondary layers are not normal maps"
-            missing_note = f" • {unresolved} key non trovate" if unresolved else ""
-            self.material_source_label.config(text=(f"{asset.name} — {len(self._material_infos)} materiali, "
-                                                   f"{len(images)}/{len(wanted_keys)} texture preview da {len(inventory)} texture BF"
-                                                   f"{source_note}{missing_note}"))
+            source_note = " - WW normal maps enabled" if ww_normal_maps else " - secondary layers are not normal maps"
+            unresolved = len(wanted_keys - set(images))
+            missing_note = f" - {unresolved} key non trovate" if unresolved else ""
+            indexing_note = " - indice BF in background" if self.project.kind == "bf" and not self._material_inventory_complete else ""
+            self.material_source_label.config(text=(
+                f"{asset.name} - {len(self._material_infos)} materiali, "
+                f"{len(images)}/{len(wanted_keys)} texture preview da {len(known_texture_keys)} texture note"
+                f"{source_note}{missing_note}{indexing_note}"
+            ))
             self.tabs.select(self.material_tab)
             if self._material_infos:
                 self.material_tree.selection_set("mat_0")
                 self.material_tree.focus("mat_0")
                 self.on_material_selected()
             self.status.set("Ready")
-            self._log(f"OK    Material scan: {asset.name} -> {len(self._material_infos)} materiali, {len(images)} texture risolte nel BF")
+            self._log(
+                f"OK    Material scan: {asset.name} -> {len(self._material_infos)} materiali, "
+                f"{len(images)} texture risolte subito"
+            )
+
+            missing_known = (wanted_keys - set(images)) - self._material_texture_decode_misses
+            full_index = self.project.kind == "bf" and not self._material_inventory_complete
+            if full_index or missing_known:
+                self._start_material_texture_search(
+                    asset, missing_known, generation, full_index
+                )
         except Exception as exc:
             self.status.set("Ready")
             self._log(f"ERROR Material scan: {exc}")
             messagebox.showerror("Material Editor", str(exc))
+
+    def _start_material_texture_search(
+        self, preferred_asset: Asset, texture_keys: set[int],
+        generation: int, full_index: bool
+    ) -> None:
+        """Build the BF texture index and decode requested previews off the UI thread."""
+        if self.project.kind != "bf" or self.project.path is None:
+            return
+        project_path = self.project.path
+        preferred_index = preferred_asset.index
+        wanted = set(texture_keys)
+        source_indices = {
+            key: asset.index for key, asset in self._material_inventory_sources.items()
+            if key in wanted
+        }
+        action = "indicizzazione texture BF" if full_index else f"caricamento di {len(wanted)} texture"
+        self.status.set(f"Ready - Material Editor: {action} in background...")
+
+        def worker() -> None:
+            found_images: dict[int, object] = {}
+            found_sources: dict[int, Asset] = {}
+            remaining = set(wanted)
+            error = ""
+            try:
+                background_project = JadeProject()
+                background_project.open_bf(project_path)
+                if full_index:
+                    candidates = [
+                        candidate for candidate in background_project.assets
+                        if candidate.index != preferred_index
+                    ]
+                else:
+                    target_indices = set(source_indices.values())
+                    candidates = [
+                        candidate for candidate in background_project.assets
+                        if candidate.index in target_indices
+                    ]
+                source_sizes: dict[int, int] = {}
+                image_sizes: dict[int, int] = {}
+                for candidate in candidates:
+                    if generation != self._material_index_generation or project_path != self.project.path:
+                        return
+                    try:
+                        candidate_data = background_project.read_asset(candidate)
+                        candidate_textures = _scan_pop_textures(candidate_data)
+                    except Exception:
+                        continue
+                    for texture in candidate_textures:
+                        payload_size = texture.data_end - texture.data_offset
+                        if full_index and payload_size > source_sizes.get(texture.key, -1):
+                            source_sizes[texture.key] = payload_size
+                            found_sources[texture.key] = candidate
+                        if texture.key not in wanted or payload_size <= 4:
+                            continue
+                        if payload_size <= image_sizes.get(texture.key, -1):
+                            continue
+                        try:
+                            found_images[texture.key] = _decode_pop_texture_image(candidate_data, texture)
+                        except Exception:
+                            continue
+                        image_sizes[texture.key] = payload_size
+                        remaining.discard(texture.key)
+            except Exception as exc:
+                error = str(exc)
+            self._material_index_queue.put((
+                generation, project_path, found_images, found_sources,
+                remaining, full_index, error
+            ))
+
+        threading.Thread(
+            target=worker, name="material-texture-index", daemon=True
+        ).start()
+        self.after(100, lambda: self._poll_material_texture_search(generation))
+
+    def _poll_material_texture_search(self, generation: int) -> None:
+        if generation != self._material_index_generation:
+            return
+        result = None
+        while result is None:
+            try:
+                candidate = self._material_index_queue.get_nowait()
+            except queue.Empty:
+                self.after(100, lambda: self._poll_material_texture_search(generation))
+                return
+            if candidate[0] == generation:
+                result = candidate
+
+        (_result_generation, project_path, found_images, found_sources,
+         remaining, full_index, error) = result
+        if project_path != self.project.path:
+            return
+        self._material_external_texture_cache.update(found_images)
+        self._material_texture_decode_misses.update(remaining)
+        self._material_inventory_sources.update(found_sources)
+        if full_index:
+            self._material_inventory_complete = True
+        self._material_textures.update(found_images)
+        self._material_texture_sources = dict(self._material_inventory_sources)
+
+        known_keys = set(self._material_inventory_sources)
+        refreshed = _scan_pop_material_records(bytes(self._material_data), known_keys)
+        ww_normal_maps = self._is_ww_normal_map_archive()
+        for index, info in enumerate(self._material_infos):
+            updated = refreshed.get(info.material_key)
+            if updated is not None:
+                info.secondary_key = updated.secondary_key
+                info.normal_key = updated.secondary_key if ww_normal_maps else None
+            diffuse = f"0x{info.texture_key:08X}" if info.texture_key is not None else "<none>"
+            secondary = f"0x{info.secondary_key:08X}" if info.secondary_key is not None else "<none>"
+            iid = f"mat_{index}"
+            if self.material_tree.exists(iid):
+                self.material_tree.item(
+                    iid, values=(f"0x{info.material_key:08X}", diffuse, secondary,
+                                 f"{info.alpha:.2f}", f"{info.metallic:.2f}")
+                )
+
+        self._material_diffuse_combo_values = [
+            f"0x{key:08X}" for key in sorted(known_keys)
+        ]
+        self.material_diffuse_combo["values"] = self._material_diffuse_combo_values
+        selected_info = self._selected_material()
+        if selected_info is not None and not self.material_diffuse_combo.get():
+            current = f"0x{selected_info.texture_key:08X}" if selected_info.texture_key is not None else ""
+            if current in self._material_diffuse_combo_values:
+                self.material_diffuse_combo.set(current)
+        self._material_preview_changed()
+
+        wanted_keys = {
+            key for info in self._material_infos
+            for key in (info.texture_key, info.secondary_key, info.normal_key)
+            if key not in (None, 0, 0xFFFFFFFF)
+        }
+        unresolved_keys = wanted_keys - set(self._material_textures)
+        source_note = " - WW normal maps enabled" if ww_normal_maps else " - secondary layers are not normal maps"
+        missing_note = f" - {len(unresolved_keys)} key non trovate" if unresolved_keys else ""
+        if self._material_source_asset is not None:
+            self.material_source_label.config(text=(
+                f"{self._material_source_asset.name} - {len(self._material_infos)} materiali, "
+                f"{len(self._material_textures)}/{len(wanted_keys)} texture preview da "
+                f"{len(known_keys)} texture BF{source_note}{missing_note}"
+            ))
+        if error:
+            self._log(f"WARN  Indice texture Material Editor: {error}")
+
+        secondary_missing = (
+            unresolved_keys & known_keys
+        ) - self._material_texture_decode_misses
+        if secondary_missing and self._material_source_asset is not None:
+            self._start_material_texture_search(
+                self._material_source_asset, secondary_missing, generation, False
+            )
+            return
+        self.status.set("Ready")
+        self._log(
+            f"OK    Indice texture Material Editor: {len(known_keys)} texture, "
+            f"{len(found_images)} preview aggiunte"
+        )
 
     def _selected_material(self) -> MaterialInfo | None:
         selection = self.material_tree.selection()
@@ -3427,59 +3910,189 @@ class JadeToolkit(tk.Tk):
         self.texture_apply_btn = ttk.Button(right, text="Applica modifiche texture", command=self.apply_texture_replacement, state="disabled")
         self.texture_apply_btn.pack(anchor="e", pady=(6, 0))
 
+    def _collect_mesh_render_resources(self, preferred_asset: Asset, data: bytes, meshes: list[MeshInfo]) -> tuple[dict[int, object], dict[int, dict[int, int]], dict[int, dict[int, tuple[float, float, float, float]]], int]:
+        """Resolve local mesh resources first, then search only unresolved keys."""
+        local_inventory: dict[int, TextureInfo] = {}
+        for texture in _scan_pop_textures(data):
+            current = local_inventory.get(texture.key)
+            if current is None or texture.data_end - texture.data_offset > current.data_end - current.data_offset:
+                local_inventory[texture.key] = texture
+
+        valid_texture_keys = set(local_inventory)
+        packs, legacy_materials = _scan_pop_materials(data)
+        records = _scan_pop_material_records(data, valid_texture_keys)
+
+        material_textures: dict[int, dict[int, int]] = {}
+        material_colors: dict[int, dict[int, tuple[float, float, float, float]]] = {}
+        wanted_keys: set[int] = set()
+        for mesh in meshes:
+            texture_map: dict[int, int] = {}
+            color_map: dict[int, tuple[float, float, float, float]] = {}
+            pack: list[int] = []
+            if mesh.material_pack_key is not None:
+                pack = packs.get(mesh.material_pack_key, [])
+                if not pack and (mesh.material_pack_key in records or mesh.material_pack_key in legacy_materials):
+                    pack = [mesh.material_pack_key]
+            for material_id, _count in mesh.material_ids:
+                material_key = None
+                if pack:
+                    pack_index = 0 if material_id < 0 else min(material_id, len(pack) - 1)
+                    material_key = pack[pack_index]
+
+                record = records.get(material_key) if material_key is not None else None
+                texture_key = record.texture_key if record is not None else legacy_materials.get(material_key)
+                if texture_key is None:
+                    direct_record = records.get(material_id)
+                    if direct_record is not None:
+                        record = direct_record
+                        texture_key = direct_record.texture_key
+                    else:
+                        texture_key = legacy_materials.get(material_id)
+
+                if texture_key not in (None, 0, 0xFFFFFFFF):
+                    texture_map[material_id] = texture_key
+                    wanted_keys.add(texture_key)
+                if record is not None:
+                    red, green, blue, alpha = _jade_color_rgba(record.diffuse_color)
+                    color_map[material_id] = (
+                        red, green, blue, max(0.0, min(1.0, alpha * record.alpha))
+                    )
+                else:
+                    color_map[material_id] = (1.0, 1.0, 1.0, 1.0)
+            material_textures[mesh.key] = texture_map
+            material_colors[mesh.key] = color_map
+
+        images: dict[int, object] = {}
+        for texture_key in wanted_keys:
+            texture = local_inventory.get(texture_key)
+            if texture is None:
+                continue
+            try:
+                images[texture_key] = _decode_pop_texture_image(data, texture)
+            except Exception as exc:
+                self._log(f"WARN  Mesh texture 0x{texture_key:08X}: {exc}")
+
+        project_path = self.project.path
+        if self._mesh_cache_project != project_path:
+            self._mesh_external_texture_cache.clear()
+            self._mesh_external_texture_misses.clear()
+            self._mesh_cache_project = project_path
+        missing = wanted_keys - set(images)
+        for texture_key in tuple(missing):
+            cached = self._mesh_external_texture_cache.get(texture_key)
+            if cached is not None:
+                images[texture_key] = cached
+                missing.discard(texture_key)
+
+        self._mesh_pending_texture_keys = missing - self._mesh_external_texture_misses
+        return images, material_textures, material_colors, len(wanted_keys - set(images))
+
+    def _start_mesh_texture_search(self, preferred_asset: Asset, texture_keys: set[int], generation: int) -> None:
+        """Resolve cross-asset texture references without blocking Tk's UI thread."""
+        if not texture_keys or self.project.kind != "bf" or self.project.path is None:
+            return
+        project_path = self.project.path
+        preferred_index = preferred_asset.index
+        wanted = set(texture_keys)
+        self.status.set(f"Ready - ricerca di {len(wanted)} texture esterne in background...")
+
+        def worker() -> None:
+            found: dict[int, object] = {}
+            remaining = set(wanted)
+            error = ""
+            try:
+                background_project = JadeProject()
+                background_project.open_bf(project_path)
+                for candidate in background_project.assets:
+                    if candidate.index == preferred_index:
+                        continue
+                    try:
+                        candidate_data = background_project.read_asset(candidate)
+                        candidate_textures = _scan_pop_textures(candidate_data)
+                    except Exception:
+                        continue
+                    for texture in candidate_textures:
+                        if texture.key not in remaining or texture.data_end - texture.data_offset <= 4:
+                            continue
+                        try:
+                            found[texture.key] = _decode_pop_texture_image(candidate_data, texture)
+                        except Exception:
+                            continue
+                        remaining.discard(texture.key)
+                    if not remaining:
+                        break
+            except Exception as exc:
+                error = str(exc)
+            self._mesh_texture_search_queue.put(
+                (generation, project_path, found, remaining, error)
+            )
+
+        threading.Thread(target=worker, name="mesh-texture-search", daemon=True).start()
+        self.after(100, lambda: self._poll_mesh_texture_search(generation))
+
+    def _poll_mesh_texture_search(self, generation: int) -> None:
+        if generation != self._mesh_texture_search_generation:
+            return
+        result = None
+        while result is None:
+            try:
+                candidate = self._mesh_texture_search_queue.get_nowait()
+            except queue.Empty:
+                self.after(100, lambda: self._poll_mesh_texture_search(generation))
+                return
+            if candidate[0] == generation:
+                result = candidate
+        result_generation, project_path, found, remaining, error = result
+        if result_generation != generation or project_path != self.project.path:
+            return
+        self._mesh_external_texture_cache.update(found)
+        self._mesh_external_texture_misses.update(remaining)
+        self._mesh_textures.update(found)
+        if found:
+            self.on_mesh_selected()
+        if self._mesh_source_asset is not None:
+            missing_note = f" - {len(remaining)} texture non risolte" if remaining else ""
+            self.mesh_source_label.config(text=(
+                f"{self._mesh_source_asset.name} - {len(self._mesh_infos)} mesh visualizzabili, "
+                f"{len(self._mesh_textures)} texture materiali risolte{missing_note}"
+            ))
+        if error:
+            self._log(f"WARN  Ricerca texture mesh in background: {error}")
+        self.status.set("Ready")
+        self._log(
+            f"OK    Ricerca texture mesh: {len(found)} trovate, {len(remaining)} non risolte"
+        )
+
     def scan_meshes(self) -> None:
         asset = self._selected_asset()
         if asset is None:
             messagebox.showinfo("Mesh Swap", "Seleziona prima un asset .wow/.bin/.gao nel browser.")
             return
         try:
+            self._mesh_texture_search_generation += 1
+            search_generation = self._mesh_texture_search_generation
+            self.status.set("Mesh Editor: lettura mesh, materiali e texture locali...")
+            self.update_idletasks()
             data = self.project.read_asset(asset)
             meshes = _scan_pop_meshes(data)
             _associate_mesh_material_packs(data, meshes)
-            packs, materials = _scan_pop_materials(data)
-            textures = _scan_pop_textures(data)
+            images, texture_maps, color_maps, unresolved = self._collect_mesh_render_resources(asset, data, meshes)
             self._mesh_data = bytearray(data)
             self._mesh_infos = meshes
             self._mesh_source_asset = asset
-            self._mesh_textures = {}
-            from PIL import Image
-            for tex in textures:
-                try:
-                    if tex.texture_type == 7:
-                        blob = _dds_blob_for_dump(data, tex)
-                    elif tex.texture_type == 0:
-                        blob = _build_tga_header(tex.storage_width, tex.storage_height, 32) + data[tex.data_offset:tex.data_offset + tex.storage_width * tex.storage_height * 4]
-                    elif tex.texture_type == 1:
-                        # Palette textures are uncommon in geometry materials;
-                        # use the existing standalone TGA converter when possible.
-                        self._texture_data = bytearray(data)
-                        self._texture_file_entries = _parse_pop_file_entries(data)
-                        blob = self._palette_tga_blob_for_texture(tex)
-                    else:
-                        continue
-                    self._mesh_textures[tex.key] = Image.open(io.BytesIO(blob)).convert("RGBA")
-                except Exception:
-                    continue
-
-            # Attach the material->texture lookup to the selected mesh without
-            # changing the raw mesh parser's standalone data model.
-            self._mesh_material_textures: dict[int, int] = {}
-            for mesh in meshes:
-                if mesh.material_pack_key is None:
-                    continue
-                pack = packs.get(mesh.material_pack_key, [])
-                for material_id, _count in mesh.material_ids:
-                    if 0 <= material_id < len(pack):
-                        texture_key = materials.get(pack[material_id])
-                        if texture_key is not None:
-                            self._mesh_material_textures[material_id] = texture_key
+            self._mesh_textures = images
+            self._mesh_material_textures_by_mesh = texture_maps
+            self._mesh_material_colors_by_mesh = color_maps
+            self._mesh_material_textures = texture_maps.get(meshes[0].key, {}) if meshes else {}
 
             self._clear_tree(self.mesh_tree)
             for i, mesh in enumerate(meshes):
                 name = mesh.object_name or f"Mesh #{i + 1}"
                 self.mesh_tree.insert("", "end", iid=f"mesh_{i}",
                                       values=(name, f"{len(mesh.vertices):,}", f"{len(mesh.faces):,}", f"0x{mesh.key:08X}"))
-            self.mesh_source_label.config(text=f"{asset.name} — {len(meshes)} mesh visualizzabili, {len(self._mesh_textures)} texture disponibili")
+            missing_note = f" - {unresolved} texture non risolte" if unresolved else ""
+            self.mesh_source_label.config(text=(f"{asset.name} - {len(meshes)} mesh visualizzabili, "
+                                                f"{len(images)} texture materiali risolte{missing_note}"))
             self.mesh_info.config(text="Seleziona un mesh. Trascina con il mouse per ruotare; rotella per zoom.")
             self.tabs.select(self.mesh_tab)
             self._mesh_yaw = -0.45
@@ -3488,14 +4101,47 @@ class JadeToolkit(tk.Tk):
             if meshes:
                 self.mesh_tree.selection_set("mesh_0")
                 self.mesh_tree.focus("mesh_0")
-                if isinstance(self.mesh_canvas, MeshViewport):
-                    self.mesh_canvas.set_scene(meshes[0], self._mesh_textures)
-                else:
-                    self._render_selected_mesh()
-            self._log(f"OK    Mesh scan: {asset.name} -> {len(meshes)} mesh, {len(self._mesh_textures)} texture")
+                self.on_mesh_selected()
+            self.status.set("Ready")
+            self._log(f"OK    Mesh scan: {asset.name} -> {len(meshes)} mesh, {len(images)} texture materiali risolte")
+            self._start_mesh_texture_search(asset, self._mesh_pending_texture_keys, search_generation)
         except Exception as exc:
+            self.status.set("Ready")
             self._log(f"ERROR Mesh scan: {exc}")
             messagebox.showerror("Mesh Swap", str(exc))
+
+    def import_swap_mesh(self) -> None:
+        source = filedialog.askopenfilename(
+            title="Import replacement mesh",
+            filetypes=[("glTF Binary", "*.glb"), ("All files", "*.*")]
+        )
+        if not source:
+            return
+        try:
+            path = Path(source)
+            mesh, textures, material_textures, material_colors = _load_glb_mesh_for_swap(path)
+            self._swap_mesh = mesh
+            self._swap_mesh_path = path
+            self._swap_mesh_textures = textures
+            self._swap_mesh_material_textures = material_textures
+            self._swap_mesh_material_colors = material_colors
+            if isinstance(self.swap_mesh_canvas, MeshViewport):
+                self.swap_mesh_canvas.set_scene(mesh, textures, material_textures, material_colors)
+            self.swap_mesh_info.config(text=(
+                f"{path.name} - {len(mesh.vertices):,} vertices - {len(mesh.faces):,} faces - "
+                f"{len(material_colors)} materiali - {len(textures)} texture\n"
+                "Preview GLB convertita in assi Jade; non e' stata ancora scritta alcuna sostituzione."
+            ))
+            self._log(f"OK    Mesh replacement import: {path.name} -> {len(mesh.vertices)} vertici, {len(mesh.faces)} facce")
+        except Exception as exc:
+            self._swap_mesh = None
+            self._swap_mesh_path = None
+            self._swap_mesh_textures = {}
+            self._swap_mesh_material_textures = {}
+            self._swap_mesh_material_colors = {}
+            self.swap_mesh_info.config(text=f"Import GLB non riuscito: {exc}")
+            self._log(f"ERROR Mesh replacement import: {exc}")
+            messagebox.showerror("Import replacement mesh", str(exc))
 
     def _selected_mesh(self) -> MeshInfo | None:
         selection = self.mesh_tree.selection()
@@ -3516,7 +4162,9 @@ class JadeToolkit(tk.Tk):
             f"version {mesh.version}" + (f" • object: {mesh.object_name}" if mesh.object_name else "")
         ))
         if isinstance(self.mesh_canvas, MeshViewport):
-            self.mesh_canvas.set_scene(mesh, self._mesh_textures)
+            texture_map = self._mesh_material_textures_by_mesh.get(mesh.key, {})
+            color_map = self._mesh_material_colors_by_mesh.get(mesh.key, {})
+            self.mesh_canvas.set_scene(mesh, self._mesh_textures, texture_map, color_map)
         else:
             self._render_selected_mesh()
 
@@ -3568,6 +4216,7 @@ class JadeToolkit(tk.Tk):
     def _render_selected_mesh(self) -> None:
         self._mesh_render_after = None
         mesh = self._selected_mesh()
+        texture_map = self._mesh_material_textures_by_mesh.get(mesh.key, {}) if mesh is not None else {}
         if mesh is None or not hasattr(self, "mesh_canvas"):
             return
         try:
@@ -3616,7 +4265,7 @@ class JadeToolkit(tk.Tk):
                 for _z, face_index, mat_id in face_records:
                     a, b, c = mesh.faces[face_index]
                     dst = [projected[a], projected[b], projected[c]]
-                    tex_key = getattr(self, "_mesh_material_textures", {}).get(mat_id)
+                    tex_key = texture_map.get(mat_id)
                     tex = self._mesh_textures.get(tex_key)
                     uv = None
                     if mesh.uv_indices and mesh.uvs:
@@ -3675,8 +4324,9 @@ class JadeToolkit(tk.Tk):
                 textures_out[texture_key] = tex_path
 
             mtl_lines = [f"# Exported by PoP BF Lab", f"# Mesh 0x{mesh.key:08X}"]
+            texture_map = self._mesh_material_textures_by_mesh.get(mesh.key, {})
             for mat_id, _count in mesh.material_ids:
-                tex_key = getattr(self, "_mesh_material_textures", {}).get(mat_id)
+                tex_key = texture_map.get(mat_id)
                 mtl_lines.append(f"newmtl mat_{mat_id}")
                 mtl_lines.append("Ka 0.2 0.2 0.2")
                 mtl_lines.append("Kd 1.0 1.0 1.0")
