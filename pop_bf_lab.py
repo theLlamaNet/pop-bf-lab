@@ -3357,6 +3357,10 @@ class JadeToolkit(tk.Tk):
                         bordercolor=palette["border"], padding=(10, 7))
         style.map("TButton", background=[("active", palette["select"]), ("disabled", palette["field"])],
                   foreground=[("disabled", palette["muted"])])
+        style.configure("Apply.TButton", background="#7a3a3a", foreground=palette["fg"],
+                        bordercolor="#a05a5a", padding=(10, 7))
+        style.map("Apply.TButton", background=[("active", "#994848"), ("disabled", "#7a3a3a")],
+                  foreground=[("disabled", palette["muted"])])
         style.configure("TNotebook", background=palette["bg"], bordercolor=palette["border"], tabmargins=(2, 2, 2, 0))
         style.configure("TNotebook.Tab", background=palette["surface"], foreground=palette["fg"], padding=(15, 9), borderwidth=0)
         style.map("TNotebook.Tab", background=[("selected", palette["select"])], foreground=[("selected", palette["fg"])])
@@ -3662,9 +3666,9 @@ class JadeToolkit(tk.Tk):
         top.pack(fill="x")
         ttk.Label(top, text="Mesh Editor", font=("TkDefaultFont", 14, "bold")).pack(side="left")
         ttk.Button(top, text="Scan selected .wow / asset", command=self.scan_meshes).pack(side="right")
-        ttk.Button(top, text="Apply mesh changes", command=self.apply_mesh_changes).pack(side="right", padx=6)
-        ttk.Button(top, text="Import replacement GLB...", command=self.import_swap_mesh).pack(side="right", padx=6)
         ttk.Button(top, text="Export mesh", command=self.export_mesh).pack(side="right", padx=6)
+        ttk.Button(top, text="Import replacement GLB...", command=self.import_swap_mesh).pack(side="right", padx=6)
+        ttk.Button(top, text="Apply mesh changes", command=self.apply_mesh_changes, style="Apply.TButton").pack(side="right", padx=6)
         self.mesh_source_label = ttk.Label(self.mesh_tab, text="Nessun mesh analizzato")
         self.mesh_source_label.pack(anchor="w", pady=(4, 8))
 
@@ -3676,11 +3680,16 @@ class JadeToolkit(tk.Tk):
         split.add(right, weight=4)
 
         ttk.Label(left, text="Mesh nel file selezionato").pack(anchor="w")
-        self.mesh_tree = ttk.Treeview(left, columns=("name", "verts", "faces", "key"), show="headings")
+        mesh_tree_frame = ttk.Frame(left)
+        mesh_tree_frame.pack(fill="both", expand=True, pady=(5, 0))
+        self.mesh_tree = ttk.Treeview(mesh_tree_frame, columns=("name", "verts", "faces", "key"), show="headings")
         for c, t, w in (("name", "Mesh", 190), ("verts", "Vertices", 80), ("faces", "Faces", 80), ("key", "Mesh ID", 105)):
             self.mesh_tree.heading(c, text=t)
             self.mesh_tree.column(c, width=w, anchor="w")
-        self.mesh_tree.pack(fill="both", expand=True, pady=(5, 0))
+        self.mesh_tree.pack(side="left", fill="both", expand=True)
+        mesh_scrollbar = ttk.Scrollbar(mesh_tree_frame, orient="vertical", command=self.mesh_tree.yview)
+        mesh_scrollbar.pack(side="right", fill="y")
+        self.mesh_tree.configure(yscrollcommand=mesh_scrollbar.set)
         self.mesh_tree.bind("<<TreeviewSelect>>", self.on_mesh_selected)
 
         preview_split = ttk.Panedwindow(right, orient="vertical")
@@ -3719,8 +3728,7 @@ class JadeToolkit(tk.Tk):
         top.pack(fill="x")
         ttk.Label(top, text="Material Editor", font=("TkDefaultFont", 14, "bold")).pack(side="left")
         ttk.Button(top, text="Scan selected .wow / asset", command=self.scan_materials).pack(side="right")
-        ttk.Button(top, text="Save changes as .BIN", command=self.save_material_changes_as_bin).pack(side="right", padx=6)
-        ttk.Button(top, text="Apply material changes", command=self.apply_material_changes).pack(side="right", padx=6)
+        ttk.Button(top, text="Apply material changes", command=self.apply_material_changes, style="Apply.TButton").pack(side="right", padx=6)
         self.material_source_label = ttk.Label(self.material_tab, text="Nessun materiale analizzato")
         self.material_source_label.pack(anchor="w", pady=(4, 8))
 
@@ -3732,12 +3740,17 @@ class JadeToolkit(tk.Tk):
         split.add(right, weight=5)
 
         ttk.Label(left, text="Materiali rilevati").pack(anchor="w")
-        self.material_tree = ttk.Treeview(left, columns=("name", "diffuse", "secondary", "opacity", "specular"), show="headings")
+        material_tree_frame = ttk.Frame(left)
+        material_tree_frame.pack(fill="both", expand=True, pady=(5, 0))
+        self.material_tree = ttk.Treeview(material_tree_frame, columns=("name", "diffuse", "secondary", "opacity", "specular"), show="headings")
         for c, t, w in (("name", "Material", 210), ("diffuse", "Diffuse", 110), ("secondary", "Secondary", 110),
                         ("opacity", "Opacity", 65), ("specular", "Spec exp.", 72)):
             self.material_tree.heading(c, text=t)
             self.material_tree.column(c, width=w, anchor="w")
-        self.material_tree.pack(fill="both", expand=True, pady=(5, 0))
+        self.material_tree.pack(side="left", fill="both", expand=True)
+        material_scrollbar = ttk.Scrollbar(material_tree_frame, orient="vertical", command=self.material_tree.yview)
+        material_scrollbar.pack(side="right", fill="y")
+        self.material_tree.configure(yscrollcommand=material_scrollbar.set)
         self.material_tree.bind("<<TreeviewSelect>>", self.on_material_selected)
 
         preview_box = ttk.LabelFrame(right, text="Material preview", padding=6)
@@ -4222,10 +4235,14 @@ class JadeToolkit(tk.Tk):
         top = ttk.Frame(self.texture_tab)
         top.pack(fill="x")
         ttk.Label(top, text="Texture Editor", font=("TkDefaultFont", 14, "bold")).pack(side="left")
+        # Widgets packed on the right are displayed in reverse packing order.
+        # Pack from right to left: Scan, Dump, Import, then Apply on the far left.
         ttk.Button(top, text="Scan selected .wow / asset", command=self.scan_textures).pack(side="right")
         ttk.Button(top, text="Dump texture", command=self.dump_texture).pack(side="right", padx=6)
         ttk.Button(top, text="Import replacement image...", command=self.import_texture_replacement).pack(side="right", padx=6)
-        ttk.Button(top, text="Save changes as .BIN", command=self.save_texture_asset).pack(side="right", padx=6)
+        self.texture_apply_btn = ttk.Button(top, text="Apply texture changes", command=self.apply_texture_replacement,
+                                            style="Apply.TButton", state="disabled")
+        self.texture_apply_btn.pack(side="right", padx=6)
         self.texture_source_label = ttk.Label(self.texture_tab, text="Nessuna texture analizzata")
         self.texture_source_label.pack(anchor="w", pady=(4, 8))
         split = ttk.Panedwindow(self.texture_tab, orient="horizontal")
@@ -4234,24 +4251,17 @@ class JadeToolkit(tk.Tk):
         right = ttk.Frame(split, padding=(8, 0, 0, 0))
         split.add(left, weight=2)
         split.add(right, weight=3)
-        left_split = ttk.Panedwindow(left, orient="vertical")
-        left_split.pack(fill="both", expand=True)
-        objects_box = ttk.Frame(left_split, padding=(0, 0, 0, 5))
-        textures_box = ttk.Frame(left_split, padding=(0, 5, 0, 0))
-        left_split.add(objects_box, weight=1)
-        left_split.add(textures_box, weight=2)
-        ttk.Label(objects_box, text="Oggetti/FileEntry nel BIN").pack(anchor="w")
-        self.texture_object_tree = ttk.Treeview(objects_box, columns=("index", "key", "size", "type"), show="headings")
-        for c, t, w in (("index", "#", 55), ("key", "File ID", 105), ("size", "Size", 90), ("type", "Data type", 105)):
-            self.texture_object_tree.heading(c, text=t)
-            self.texture_object_tree.column(c, width=w, anchor="w")
-        self.texture_object_tree.pack(fill="both", expand=True, pady=(5, 0))
-        ttk.Label(textures_box, text="Texture nel file selezionato").pack(anchor="w")
-        self.texture_tree = ttk.Treeview(textures_box, columns=("name", "size", "format", "dims"), show="headings")
+        ttk.Label(left, text="Texture nel file selezionato").pack(anchor="w")
+        texture_tree_frame = ttk.Frame(left)
+        texture_tree_frame.pack(fill="both", expand=True, pady=(5, 0))
+        self.texture_tree = ttk.Treeview(texture_tree_frame, columns=("name", "size", "format", "dims"), show="headings")
         for c, t, w in (("name", "Texture", 220), ("size", "Size", 90), ("format", "Format", 150), ("dims", "Dimensions", 100)):
             self.texture_tree.heading(c, text=t)
             self.texture_tree.column(c, width=w, anchor="w")
-        self.texture_tree.pack(fill="both", expand=True, pady=(5, 0))
+        self.texture_tree.pack(side="left", fill="both", expand=True)
+        texture_scrollbar = ttk.Scrollbar(texture_tree_frame, orient="vertical", command=self.texture_tree.yview)
+        texture_scrollbar.pack(side="right", fill="y")
+        self.texture_tree.configure(yscrollcommand=texture_scrollbar.set)
         self.texture_tree.bind("<<TreeviewSelect>>", self.on_texture_selected)
         original_box = ttk.LabelFrame(right, text="Texture selezionata", padding=8)
         original_box.pack(fill="both", expand=True)
@@ -4270,8 +4280,6 @@ class JadeToolkit(tk.Tk):
         ttk.Button(transform_box, text="Flip asse Y", command=lambda: self.flip_texture("y")).pack(side="left", padx=(6, 0))
         self.texture_transform_label = ttk.Label(transform_box, text="Rotazione: 0° • Flip X: no • Flip Y: no")
         self.texture_transform_label.pack(side="left", padx=(10, 0))
-        self.texture_apply_btn = ttk.Button(right, text="Applica modifiche texture", command=self.apply_texture_replacement, state="disabled")
-        self.texture_apply_btn.pack(anchor="e", pady=(6, 0))
 
     def _collect_mesh_render_resources(self, preferred_asset: Asset, data: bytes, meshes: list[MeshInfo]) -> tuple[dict[int, object], dict[int, dict[int, int]], dict[int, dict[int, tuple[float, float, float, float]]], int]:
         """Resolve local mesh resources first, then search only unresolved keys."""
@@ -5498,13 +5506,6 @@ class JadeToolkit(tk.Tk):
             self._texture_infos = infos
             self._texture_source_asset = asset
             self._texture_dirty = False
-            self._clear_tree(self.texture_object_tree)
-            for entry in entries:
-                data_type = f"0x{entry.data_type:08X}" if entry.data_type is not None else "—"
-                self.texture_object_tree.insert(
-                    "", "end", iid=f"obj_{entry.index}",
-                    values=(entry.index, f"0x{entry.key:08X}", f"{entry.size:,}", data_type),
-                )
             self._clear_tree(self.texture_tree)
             for i, tex in enumerate(infos):
                 self.texture_tree.insert("", "end", iid=f"tex_{i}", values=(f"Texture #{i + 1} 0x{tex.key:08X}", f"{tex.data_end - tex.data_offset:,} B", tex.format, f"{tex.width} x {tex.height}"))
