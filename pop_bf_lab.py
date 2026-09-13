@@ -5987,7 +5987,9 @@ class JadeToolkit(tk.Tk):
             "Thanks & credits\n"
             "• bf_repacker_2018_05_23_1419 — by BlackDaemon\n"
             "• bin_repacker_2018_05_29_0806 — by BlackDaemon\n"
-            "• io_scene_pop (Blender addon) — by kugelrund\n\n"
+            "• io_scene_pop (Blender addon) — by kugelrund\n"
+            "• Jade Toolkit — by kaminoer\n"
+            "• popww_world_editor — by Khrysos\n\n"
             "Jade Engine and Prince of Persia are properties of Ubisoft and their respective owners.\n"
             "This project is an independent community tool and is not affiliated with or endorsed by Ubisoft."
         )
