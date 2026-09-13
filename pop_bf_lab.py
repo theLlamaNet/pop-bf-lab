@@ -20,13 +20,16 @@ import queue
 import io
 import shutil
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import jade_mesh
 VENDOR_DIR = ROOT / "vendor"
 if VENDOR_DIR.is_dir() and str(VENDOR_DIR) not in sys.path:
     sys.path.insert(0, str(VENDOR_DIR))
@@ -124,6 +127,10 @@ class MeshInfo:
     second_uv_indices: list[tuple[int, int, int]] | None = None
     second_material_ids: list[tuple[int, int]] | None = None
     normals: list[tuple[float, float, float]] | None = None
+    skin_bones: list[jade_mesh.SkinBone] | None = None
+    skin_flags: int = 0
+    source_joint_names: tuple[str, ...] = ()
+    layout_name: str = ""
 
 
 @dataclass
@@ -586,7 +593,7 @@ def _scan_pop_meshes(data: bytes) -> list[MeshInfo]:
                 meshes.append(direct)
                 continue
             flags = r.u32()
-            has_second_mesh = r.u32() != 0
+            _flags2 = r.u32()
             num_vertices = r.u32()
             num_unknown = r.u32()
             has_unknown = r.u32() != 0
@@ -595,21 +602,10 @@ def _scan_pop_meshes(data: bytes) -> list[MeshInfo]:
             if num_vertices == 0 or num_vertices > 500_000 or num_uvs > 1_000_000 or num_materials > 4096:
                 continue
 
-            if flags & 0x8 or flags & 0x10:
-                r.f32()
-                has_normals = r.i16() != 0
-                num4 = r.i16()
-                for _ in range(max(0, num4)):
-                    r.i16()
-                    num_floats = r.i16()
-                    r.f32s(16)
-                    r.u32()
-                    r.f32s(num_floats)
-                if num4 > 0:
-                    has_normals = r.u32() != 0 or has_normals
-            else:
-                r.u32()
-                has_normals = r.u32() != 0
+            raw = data[entry.data_offset:entry.data_offset + entry.size]
+            layout = jade_mesh.read_layout(raw)
+            has_normals = layout.normals
+            r.pos = layout.vertex_offset - 4
 
             vertex_data = r.f32s(3 * num_vertices)
             vertices = list(zip(vertex_data[0::3], vertex_data[1::3], vertex_data[2::3]))
@@ -643,11 +639,6 @@ def _scan_pop_meshes(data: bytes) -> list[MeshInfo]:
                 uv_indices.append(tuple(face_data[base + 3:base + 6]))
                 faces.append(face)
 
-            # Remaining mesh metadata is deliberately ignored. The primary
-            # geometry above is all Mesh Swap needs for a faithful preview/export.
-            if has_second_mesh:
-                pass
-
             if any(i < 0 or i >= num_vertices for f in faces for i in f):
                 continue
             if any(i < 0 or i >= max(1, num_uvs) for f in uv_indices for i in f):
@@ -658,47 +649,15 @@ def _scan_pop_meshes(data: bytes) -> list[MeshInfo]:
                 uvs = []
                 uv_indices = []
             second_vertices = second_faces = second_uvs = second_uv_indices = second_material_ids = None
-            if has_second_mesh and r.pos + 16 <= len(r.data):
-                try:
-                    second_material_ids = []
-                    second_face_count = 0
-                    for _ in range(num_materials):
-                        count = r.u32(); material_id = r.i32()
-                        second_material_ids.append((material_id, count))
-                        second_face_count += count
-                    _size = r.u32(); _unknown = r.u32(); second_vertex_count = r.u32(); block_length = r.u32()
-                    if second_vertex_count <= 500_000 and block_length in (20, 32, 44, 52, 64):
-                        second_vertices = []
-                        second_uvs = []
-                        for _ in range(second_vertex_count):
-                            second_vertices.append(tuple(r.f32s(3)))
-                            if block_length in (32, 44, 52, 64):
-                                r.f32s(3)
-                            if block_length == 20:
-                                second_uvs.append(tuple(r.f32s(2)))
-                            elif block_length == 32:
-                                second_uvs.append(tuple(r.f32s(2)))
-                            elif block_length == 44:
-                                second_uvs.append(tuple(r.f32s(2)))
-                                r.f32s(3)
-                            elif block_length == 52:
-                                r.i16s(2); r.u32(); r.f32s(3)
-                                second_uvs.append(tuple(r.f32s(2)))
-                            else:
-                                r.i16s(2); r.u32(); r.f32s(3)
-                                second_uvs.append(tuple(r.f32s(2)))
-                                r.u32(); r.f32s(2)
-                        raw_faces = r.i16s(second_face_count * 3)
-                        second_faces = [tuple(raw_faces[i:i + 3]) for i in range(0, len(raw_faces), 3)]
-                        second_uv_indices = list(second_faces)
-                except (ValueError, struct.error):
-                    second_vertices = second_faces = second_uvs = second_uv_indices = second_material_ids = None
-
+            # The cooked VB is a rendering representation of this same mesh,
+            # not a second object; drawing both would cause z-fighting.
             meshes.append(MeshInfo(len(meshes), entry.key, entry.index, version,
                                    vertices, faces, uvs, uv_indices, material_ids,
                                    second_vertices=second_vertices, second_faces=second_faces,
                                    second_uvs=second_uvs, second_uv_indices=second_uv_indices,
-                                   second_material_ids=second_material_ids, normals=normals))
+                                   second_material_ids=second_material_ids, normals=normals,
+                                   skin_bones=layout.bones, skin_flags=layout.skin_flags,
+                                   layout_name="Character / skin" if layout.bones else "Mesh statica"))
         except (ValueError, IndexError, struct.error):
             continue
     return meshes
@@ -1125,54 +1084,59 @@ def _read_glb_for_mesh_swap(path: Path) -> tuple[dict, list[bytes]]:
     return document, buffers
 
 
-def _glb_accessor_values(document: dict, buffers: list[bytes], accessor_index: int) -> list[tuple[float, ...]]:
-    """Decode a non-sparse glTF accessor with its byte stride respected."""
-    accessors = document.get("accessors", [])
-    views = document.get("bufferViews", [])
-    if not (0 <= accessor_index < len(accessors)):
-        raise ValueError(f"Accessor GLB {accessor_index} non trovato.")
+def _glb_accessor_values(document: dict, buffers: list[bytes], accessor_index: int):
+    """Bounds-checked glTF accessors, including normalized and sparse data."""
+    accessors, views = document.get("accessors", []), document.get("bufferViews", [])
+    if not isinstance(accessor_index, int) or not 0 <= accessor_index < len(accessors):
+        raise ValueError("Accessor GLB non trovato.")
     accessor = accessors[accessor_index]
-    if "sparse" in accessor:
-        raise ValueError("Accessor GLB sparse non ancora supportati.")
-    view_index = accessor.get("bufferView")
-    if not isinstance(view_index, int) or not (0 <= view_index < len(views)):
-        raise ValueError("Accessor GLB senza bufferView valido.")
-    view = views[view_index]
-    buffer_index = view.get("buffer", 0)
-    if not isinstance(buffer_index, int) or not (0 <= buffer_index < len(buffers)):
-        raise ValueError("Buffer GLB non disponibile.")
+    formats = {5120:("b",1),5121:("B",1),5122:("h",2),5123:("H",2),5125:("I",4),5126:("f",4)}
     component_type = accessor.get("componentType")
-    component_formats = {
-        5120: ("b", 1), 5121: ("B", 1), 5122: ("h", 2),
-        5123: ("H", 2), 5125: ("I", 4), 5126: ("f", 4),
-    }
-    if component_type not in component_formats:
-        raise ValueError(f"Tipo componente GLB {component_type} non supportato.")
-    components = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}.get(accessor.get("type"))
+    components = {"SCALAR":1,"VEC2":2,"VEC3":3,"VEC4":4,"MAT4":16}.get(accessor.get("type"))
     count = accessor.get("count")
-    if components is None or not isinstance(count, int) or count < 0:
-        raise ValueError("Accessor GLB con type/count non valido.")
-    fmt, component_size = component_formats[component_type]
-    element_size = component_size * components
-    stride = view.get("byteStride", element_size)
-    if not isinstance(stride, int) or stride < element_size:
-        raise ValueError("byteStride GLB non valido.")
-    offset = int(view.get("byteOffset", 0)) + int(accessor.get("byteOffset", 0))
-    data = buffers[buffer_index]
-    if offset < 0 or count and offset + (count - 1) * stride + element_size > len(data):
-        raise ValueError("Accessor GLB oltre il buffer.")
-    normalized = bool(accessor.get("normalized", False))
-    limits = {5120: 127.0, 5121: 255.0, 5122: 32767.0, 5123: 65535.0, 5125: 4294967295.0}
-    values: list[tuple[float, ...]] = []
-    for item in range(count):
-        decoded = struct.unpack_from("<" + fmt * components, data, offset + item * stride)
-        if normalized and component_type != 5126:
-            if component_type in (5120, 5122):
-                decoded = tuple(max(-1.0, value / limits[component_type]) for value in decoded)
-            else:
-                decoded = tuple(value / limits[component_type] for value in decoded)
-        values.append(tuple(float(value) for value in decoded))
-    return values
+    if component_type not in formats or components is None or not isinstance(count,int) or not 0 <= count <= 2000000:
+        raise ValueError("Tipo o conteggio accessor GLB non valido.")
+    fmt, component_size = formats[component_type]
+    def read_view(view_index, offset, n, fmt, size, components, allow_stride=True):
+        if not isinstance(view_index,int) or not 0 <= view_index < len(views):
+            raise ValueError("bufferView GLB non valida.")
+        view = views[view_index]
+        bi = view.get("buffer",0)
+        if not isinstance(bi,int) or not 0 <= bi < len(buffers):
+            raise ValueError("Buffer GLB non disponibile.")
+        start, length = view.get("byteOffset",0), view.get("byteLength")
+        stride = view.get("byteStride",size*components) if allow_stride else size*components
+        if any(not isinstance(x,int) or x<0 for x in (start,length,offset,stride)) or stride < size*components or stride%size:
+            raise ValueError("Offset, lunghezza o stride GLB non validi.")
+        end = offset + ((n-1)*stride+size*components if n else 0)
+        if start+length > len(buffers[bi]) or end > length:
+            raise ValueError("Accessor GLB oltre la propria bufferView.")
+        return [struct.unpack_from("<"+fmt*components,buffers[bi],start+offset+i*stride) for i in range(n)]
+    if "bufferView" in accessor:
+        values = read_view(accessor["bufferView"],accessor.get("byteOffset",0),count,fmt,component_size,components)
+    else:
+        if accessor.get("byteOffset",0): raise ValueError("Accessor senza bufferView con offset non nullo.")
+        values = [(0,)*components for _ in range(count)]
+    if "sparse" in accessor:
+        sparse = accessor["sparse"]
+        sn = sparse.get("count")
+        if not isinstance(sn,int) or not 0 < sn <= count: raise ValueError("Conteggio sparse GLB non valido.")
+        si, sv = sparse.get("indices",{}), sparse.get("values",{})
+        st = si.get("componentType")
+        if st not in (5121,5123,5125): raise ValueError("Tipo indici sparse non valido.")
+        sf, ss = formats[st]
+        indices = read_view(si.get("bufferView"),si.get("byteOffset",0),sn,sf,ss,1,False)
+        replacements = read_view(sv.get("bufferView"),sv.get("byteOffset",0),sn,fmt,component_size,components,False)
+        previous = -1
+        for (i,),value in zip(indices,replacements):
+            if not previous < i < count: raise ValueError("Indici sparse non ordinati o fuori intervallo.")
+            values[i] = value; previous = i
+    limits = {5120:127.,5121:255.,5122:32767.,5123:65535.,5125:4294967295.}
+    if accessor.get("normalized") and component_type != 5126:
+        values = [tuple(max(-1.,x/limits[component_type]) for x in value) for value in values]
+    if any(not math.isfinite(x) for value in values for x in value):
+        raise ValueError("Accessor GLB con valori non finiti.")
+    return [tuple(float(x) for x in value) for value in values]
 
 
 def _glb_image(document: dict, buffers: list[bytes], image_index: int, source_path: Path):
@@ -1269,10 +1233,9 @@ def _glb_transform_normal(matrix: tuple[float, ...], normal: tuple[float, float,
 
 
 def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], dict[int, int], dict[int, tuple[float, float, float, float]]]:
-    """Flatten a static GLB to Jade axes, baking node transforms and hierarchy."""
+    """Import rest geometry to Jade axes; detect rigs for rebinding to the BF skin."""
     document, buffers = _read_glb_for_mesh_swap(path)
-    if document.get("skins"):
-        raise ValueError("Questo GLB contiene una skin; usa il futuro importatore characters/skeleton.")
+    source_joint_names = []
     meshes = document.get("meshes", [])
     if not isinstance(meshes, list) or not meshes:
         raise ValueError("Il GLB non contiene mesh.")
@@ -1280,7 +1243,7 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
     if not isinstance(nodes, list):
         raise ValueError("La tabella nodi GLB non è valida.")
     identity = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
-    instances: list[tuple[int, tuple[float, ...], str]] = []
+    instances = []
     child_nodes: set[int] = set()
     for node in nodes:
         children = node.get("children", []) if isinstance(node, dict) else []
@@ -1294,16 +1257,25 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
         node = nodes[index]
         if not isinstance(node, dict):
             raise ValueError("Nodo GLB non valido.")
+        joint_names = ()
         if "skin" in node:
-            raise ValueError("Questo nodo GLB usa una skin; usa il futuro importatore characters/skeleton.")
+            skins = document.get("skins", [])
+            skin_index = node["skin"]
+            if not isinstance(skin_index, int) or not 0 <= skin_index < len(skins):
+                raise ValueError("Riferimento skin GLB non valido.")
+            joints = skins[skin_index].get("joints", [])
+            if not joints or len(set(joints)) != len(joints) or any(not isinstance(j, int) or not 0 <= j < len(nodes) for j in joints):
+                raise ValueError("Tabella joints GLB non valida.")
+            joint_names = tuple(str(nodes[j].get("name") or f"joint_{j}") for j in joints)
+            source_joint_names.extend(joint_names)
         world = _glb_mat_mul(parent, _glb_node_matrix(node))
         mesh_index = node.get("mesh")
         if mesh_index is not None:
             if not isinstance(mesh_index, int) or not 0 <= mesh_index < len(meshes):
                 raise ValueError("Nodo GLB con riferimento mesh non valido.")
             if "weights" in node:
-                raise ValueError("Morph target GLB non supportati per lo swap statico.")
-            instances.append((mesh_index, world, str(node.get("name") or meshes[mesh_index].get("name") or f"mesh_{mesh_index}")))
+                raise ValueError("Morph target GLB non supportati: esportare la posa di riposo.")
+            instances.append((mesh_index, world, str(node.get("name") or meshes[mesh_index].get("name") or f"mesh_{mesh_index}"), joint_names))
         for child in node.get("children", []):
             visit(child, world, ancestry | {index})
 
@@ -1322,7 +1294,7 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
                 raise ValueError("Scena GLB con nodo radice non valido.")
             visit(root, identity, set())
     else:
-        instances = [(index, identity, str(mesh.get("name") or f"mesh_{index}"))
+        instances = [(index, identity, str(mesh.get("name") or f"mesh_{index}"), ())
                      for index, mesh in enumerate(meshes) if isinstance(mesh, dict)]
     if not instances:
         raise ValueError("Il GLB non contiene istanze mesh nella scena attiva.")
@@ -1339,7 +1311,7 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
     material_textures: dict[int, int] = {}
     material_colors: dict[int, tuple[float, float, float, float]] = {}
 
-    for mesh_index, transform, instance_name in instances:
+    for mesh_index, transform, instance_name, joint_names in instances:
         mesh_document = meshes[mesh_index]
         if not isinstance(mesh_document, dict) or not isinstance(mesh_document.get("primitives"), list):
             raise ValueError("Mesh GLB senza primitive valide.")
@@ -1353,8 +1325,8 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
             if mode not in (4, 5, 6):
                 continue  # Skip points/lines automatically; they cannot form a Jade mesh.
             attrs = primitive.get("attributes", {})
-            if not isinstance(attrs, dict) or primitive.get("targets") or any(key.startswith(("JOINTS_", "WEIGHTS_")) for key in attrs):
-                raise ValueError("Skin e morph target richiedono l'importatore characters.")
+            if not isinstance(attrs, dict) or primitive.get("targets"):
+                raise ValueError("Morph target non supportati: esportare la geometria in posa di riposo senza morph.")
             position_accessor = attrs.get("POSITION")
             if not isinstance(position_accessor, int):
                 raise ValueError("Primitiva priva di POSITION.")
@@ -1387,6 +1359,21 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
             triangles = [triangle for triangle in triangles if len(set(triangle)) == 3]
             if not triangles:
                 continue
+            if joint_names:
+                if "JOINTS_0" not in attrs or "WEIGHTS_0" not in attrs:
+                    raise ValueError("Mesh skinned senza JOINTS_0/WEIGHTS_0.")
+                for joint_attr in (key for key in attrs if key.startswith("JOINTS_")):
+                    weight_attr = "WEIGHTS_" + joint_attr[7:]
+                    if weight_attr not in attrs:
+                        raise ValueError("Attributo WEIGHTS corrispondente mancante.")
+                    jvalues = _glb_accessor_values(document, buffers, attrs[joint_attr])
+                    wvalues = _glb_accessor_values(document, buffers, attrs[weight_attr])
+                    if len(jvalues) != len(positions) or len(wvalues) != len(positions):
+                        raise ValueError("Conteggio JOINTS/WEIGHTS diverso da POSITION.")
+                    if any(len(js) != 4 or any(j != int(j) or not 0 <= j < len(joint_names) for j in js) for js in jvalues):
+                        raise ValueError("Indici joints GLB fuori intervallo.")
+                    if any(len(ws) != 4 or any(not math.isfinite(w) or w < 0 for w in ws) for ws in wvalues):
+                        raise ValueError("Pesi GLB non validi.")
             vertex_start, uv_start = len(vertices), len(uvs)
             converted_positions = []
             for position in positions:
@@ -1425,10 +1412,124 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
                         material_textures[material_id] = texture_key
     if not faces:
         raise ValueError("Il GLB non contiene triangoli importabili.")
-    label = ", ".join(dict.fromkeys(name for _, _, name in instances))
+    label = ", ".join(dict.fromkeys(name for _, _, name, _ in instances))
     mesh = MeshInfo(0, 0, -1, 0, vertices, faces, uvs, uv_indices, material_ids,
-                    object_name=label or path.stem, normals=normals)
+                    object_name=label or path.stem, normals=normals,
+                    source_joint_names=tuple(dict.fromkeys(source_joint_names)),
+                    layout_name="Character GLB" if source_joint_names else "Mesh statica GLB")
     return mesh, preview_images, material_textures, material_colors
+
+def _load_obj_mesh_for_swap(path: Path, axes: str = "Auto"):
+    """OBJ corners retain independent position/UV/normal indices and materials."""
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    jade_axes = axes == "Jade Z-up" or (axes == "Auto" and "# Exported by PoP BF Lab" in text[:200])
+    def convert(p): return tuple(p) if jade_axes else (p[0], -p[2], p[1])
+    positions, texcoords, source_normals = [], [], []
+    vertices, normals, faces, uv_faces, materials = [], [], [], [], []
+    lookup, material_lookup, libraries = {}, {}, []
+    material = 0
+    smoothing = "off"
+    groups = []
+    def index(value, count):
+        n = int(value)
+        result = n - 1 if n > 0 else count + n
+        if n == 0 or not 0 <= result < count: raise ValueError("Indice OBJ fuori intervallo.")
+        return result
+    # OBJ line continuation is common in hand-authored polygons.
+    text = text.replace("\\\n", " ")
+    for line_number, line in enumerate(text.splitlines(), 1):
+        parts = line.split("#", 1)[0].split()
+        if not parts: continue
+        op, values = parts[0], parts[1:]
+        try:
+            if op in ("v", "vt", "vn"):
+                size = 2 if op == "vt" else 3
+                v = [float(x) for x in values[:size]]
+                if op == "vt" and len(v) == 1: v.append(0.0)
+                if len(v) != size or not all(math.isfinite(x) and abs(x) <= 3.4e38 for x in v):
+                    raise ValueError("Coordinate OBJ non valide.")
+                if op == "v":
+                    if len(values) == 4:
+                        w = float(values[3])
+                        if not math.isfinite(w) or abs(w) < 1e-20: raise ValueError("Coordinata omogenea OBJ nulla.")
+                        v = [x/w for x in v]
+                    positions.append(convert(v))
+                elif op == "vn": source_normals.append(convert(v))
+                else: texcoords.append((v[0], 1.0-v[1]))
+            elif op == "usemtl":
+                name = " ".join(values)
+                if name not in material_lookup: material_lookup[name] = len(material_lookup)
+                material = material_lookup[name]
+            elif op == "s": smoothing = values[0] if values else "off"
+            elif op in ("o", "g"): groups.append(" ".join(values))
+            elif op == "mtllib": libraries.append(" ".join(values))
+            elif op == "f":
+                corners = []
+                for value in values:
+                    ref = value.split("/")
+                    if len(ref) > 3: raise ValueError("Riferimento faccia OBJ non valido.")
+                    vi = index(ref[0], len(positions))
+                    ti = index(ref[1], len(texcoords)) if len(ref) > 1 and ref[1] else None
+                    ni = index(ref[2], len(source_normals)) if len(ref) > 2 and ref[2] else None
+                    corners.append((vi, ti, ni))
+                for triangle in jade_mesh.triangulate_polygon([positions[v] for v,_,_ in corners]):
+                    face, uv = [], []
+                    for c in triangle:
+                        vi, ti, ni = corners[c]
+                        pair = (vi, ni, None if ni is not None else (line_number if smoothing in ("off", "0") else smoothing))
+                        if pair not in lookup:
+                            lookup[pair] = len(vertices)
+                            vertices.append(positions[vi])
+                            normals.append(source_normals[ni] if ni is not None else None)
+                        face.append(lookup[pair]); uv.append(ti)
+                    faces.append(tuple(face)); uv_faces.append(tuple(uv))
+                    if materials and materials[-1][0] == material:
+                        materials[-1] = (material, materials[-1][1] + 1)
+                    else: materials.append((material, 1))
+        except (ValueError, IndexError) as exc:
+            raise ValueError(f"OBJ riga {line_number}: {exc}") from exc
+    if not faces: raise ValueError("L'OBJ non contiene facce importabili.")
+    if any(i is None for f in uv_faces for i in f):
+        fallback_uv = len(texcoords)
+        texcoords.append((0.0, 0.0))
+        uv_faces = [tuple(fallback_uv if i is None else i for i in f) for f in uv_faces]
+    computed = _mesh_vertex_normals(vertices, faces)
+    normals = [n if n is not None else computed[i] for i,n in enumerate(normals)]
+    images, textures, colors = {}, {}, {}
+    for library in libraries:
+        mtl_path = path.parent / library
+        if not mtl_path.is_file(): continue
+        current = None
+        for line in mtl_path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+            parts = line.split("#", 1)[0].split()
+            if not parts: continue
+            op, values = parts[0], parts[1:]
+            if op == "newmtl": current = material_lookup.get(" ".join(values))
+            elif current is not None:
+                if op == "Kd" and len(values) >= 3:
+                    colors[current] = tuple(max(0., min(1., float(x))) for x in values[:3]) + (colors.get(current, (1.,)*4)[3],)
+                elif op in ("d", "Tr") and values:
+                    alpha = float(values[0]); alpha = 1-alpha if op == "Tr" else alpha
+                    colors[current] = colors.get(current, (1.,)*4)[:3] + (max(0., min(1., alpha)),)
+                elif op == "map_Kd" and values and not values[0].startswith("-"):
+                    image_path = mtl_path.parent / " ".join(values)
+                    if image_path.is_file():
+                        from PIL import Image
+                        with Image.open(image_path) as image:
+                            key = 0xF0000000 + current
+                            images[key] = image.convert("RGBA")
+                            textures[current] = key
+    mesh = MeshInfo(0,0,-1,0,vertices,faces,texcoords,uv_faces,materials,
+                    object_name=", ".join(dict.fromkeys(groups)) or path.stem,
+                    normals=normals, layout_name="Mesh statica OBJ")
+    return mesh, images, textures, colors
+
+
+def _load_mesh_for_swap(path: Path, obj_axes: str = "Auto"):
+    if path.suffix.lower() == ".obj": return _load_obj_mesh_for_swap(path, obj_axes)
+    if path.suffix.lower() == ".glb": return _load_glb_mesh_for_swap(path)
+    raise ValueError("Formato mesh non supportato: scegliere .glb o .obj.")
+
 
 def _mesh_vertex_normals(vertices, faces):
     normals = [[0.0, 0.0, 0.0] for _ in vertices]
@@ -1464,8 +1565,34 @@ def _mesh_rli_replacements(data: bytes, target: MeshInfo, mesh: MeshInfo) -> dic
         gro_key = struct.unpack_from("<I", payload, visual)[0]
         if gro_key != target.key:
             group = next((e for e in entries if e.key == gro_key and e.data_type != 1), None)
-            if group and struct.pack("<I", target.key) in data[group.data_offset:group.data_offset + group.size]:
-                raise ValueError("Mesh in un geometry group: lo swap del gruppo richiede l'importatore avanzato.")
+            if not group:
+                continue
+            group_raw = data[group.data_offset:group.data_offset + group.size]
+            if struct.pack("<I", target.key) not in group_raw:
+                continue
+            # Retail StaticLOD: GRO header (8 B), count (1 B), six distance
+            # bytes, then keys. Editor streams may retain one dummy byte.
+            if group.data_type != 8 or len(group_raw) < 15:
+                raise ValueError("Gruppo geometrico non riconosciuto: sostituzione annullata.")
+            count = group_raw[8]
+            key_offset = len(group_raw) - count * 4
+            if not 1 <= count <= 6 or key_offset not in (15, 16):
+                raise ValueError("Tabella StaticLOD non valida.")
+            keys = struct.unpack_from("<" + "I" * count, group_raw, key_offset)
+            if target.key not in keys:
+                continue
+            # LOD resources and skeleton links remain keyed to the same GEO.
+            # A shared nonempty RLI table cannot be assigned to one LOD by
+            # vertex count alone (two LODs can have the same count).
+            for rli_marker in range(visual + 8, min(visual + 64, len(payload)-9)):
+                if payload[rli_marker:rli_marker+2] != b"\xff\xff":
+                    continue
+                rli_count = struct.unpack_from("<I", payload, rli_marker+2)[0]
+                rli_end = rli_marker + 6 + rli_count * 4
+                if rli_end+4 <= len(payload) and struct.unpack_from("<I", payload, rli_end)[0] == 1:
+                    if rli_count:
+                        raise ValueError("StaticLOD con RLI condivisa non vuota: associazione dei colori ambigua.")
+                    break
             continue
         marker = b"\xff\xff" + struct.pack("<I", len(target.vertices))
         pos = payload.find(marker, visual, min(visual + 69, len(payload)))
@@ -1496,127 +1623,13 @@ def _mesh_rli_replacements(data: bytes, target: MeshInfo, mesh: MeshInfo) -> dic
 
 
 def _build_static_mesh_replacement(data: bytes, target: MeshInfo, mesh: MeshInfo) -> bytes:
-    """Retail split-array GEO + cooked VB/IB, following Jade Toolkit Gltf.cpp.
-
-    Keep the resource key and material slots. Unknown skin/MRM data is rejected.
-    Host RLI tables are rebuilt separately by _mesh_rli_replacements.
-    """
+    """Compatibility entry point; now handles static and skinned retail GEO."""
     entry = _parse_pop_file_entries(data)[target.entry_index]
+    if entry.key != target.key:
+        raise ValueError("Mesh sorgente cambiata: riscansiona l'asset.")
     raw = data[entry.data_offset:entry.data_offset + entry.size]
-    if entry.key != target.key or len(raw) < 44:
-        raise ValueError("Mesh sorgente non valida; riscansiona l'asset.")
-    header = struct.unpack_from("<11I", raw)
-    kind, version, flags, flags2, nv, nc, colors, nu, ne, mrm, has_normals = header
-    reader = _PopReader(raw[4:]); reader.pos = 4
-    if _scan_pop3_direct_mesh(reader, entry, version) is not None:
-        raise ValueError("Il formato interleaved del prototipo non è ancora supportato per lo swap.")
-    if kind != 1 or version not in (7, 8) or flags & 0x18 or mrm:
-        raise ValueError("Mesh con skin/MRM o layout non supportato: serve l'importatore avanzato.")
-    if (nv, nu, ne) != (len(target.vertices), len(target.uvs), len(target.material_ids)):
-        raise ValueError("Il layout GEO non corrisponde alla mesh selezionata.")
-    if not 1 <= len(mesh.vertices) <= 32768 or not 1 <= len(mesh.uvs) <= 32768:
-        raise ValueError("La prima versione supporta da 1 a 32768 vertici e UV.")
-    if not mesh.faces or len(mesh.faces) != len(mesh.uv_indices):
-        raise ValueError("Facce o indici UV mancanti.")
-    for values, size in ((mesh.vertices, 3), (mesh.uvs, 2)):
-        if any(len(v) != size or any(not math.isfinite(x) or abs(x) > 3.4e38 for x in v) for v in values):
-            raise ValueError("Coordinate non valide o fuori intervallo float32.")
-    for faces, count in ((mesh.faces, len(mesh.vertices)), (mesh.uv_indices, len(mesh.uvs))):
-        if any(len(f) != 3 or any(not isinstance(i, int) or not 0 <= i < count for i in f) for f in faces):
-            raise ValueError("Indici triangolari fuori intervallo.")
-    if not target.material_ids:
-        raise ValueError("La mesh originale non ha slot materiale utilizzabili.")
-    if any(count <= 0 for _, count in mesh.material_ids) or sum(c for _, c in mesh.material_ids) != len(mesh.faces):
-        raise ValueError("Conteggi delle primitive non validi.")
-    imported_counts = [count for _, count in mesh.material_ids]
-    slot_count = len(target.material_ids)
-    if len(imported_counts) > slot_count:
-        # The BF already owns these material slots. Keep early primitives on
-        # their respective slots and merge the remainder into the last slot.
-        imported_counts = (imported_counts[:slot_count - 1]
-                           + [sum(imported_counts[slot_count - 1:])])
-    elements = [(target.material_ids[index][0], count)
-                for index, count in enumerate(imported_counts)]
-    # Preserve empty original slots too: other engine records may reference them.
-    elements += [(material, 0) for material, _ in target.material_ids[len(elements):]]
-    normals = mesh.normals or _mesh_vertex_normals(mesh.vertices, mesh.faces)
-    if len(normals) != len(mesh.vertices) or any(len(n) != 3 or not all(math.isfinite(x) and abs(x) < 3.4e38 for x in n) for n in normals):
-        raise ValueError("Normali non valide.")
-    normals = [tuple(x / length for x in n) if (length := math.hypot(*n)) > 1e-20
-               else (0.0, 0.0, 1.0) for n in normals]
-    # Validate the original tail exactly before selecting the cooked draw format.
-    color_offset = 44 + nv * 12 * (2 if has_normals else 1)
-    color_count = min(nc, nv) if colors else 0
-    body_end = color_offset + color_count * 4 + nu * 8 + ne * 8 + len(target.faces) * 16
-    tail = raw[body_end:]
-    vb_magic, stride, tail_prefix, index_bytes = 2, 32, 16, False
-    if tail not in (b"", bytes(8)):
-        r = _PopReader(tail)
-        if len(tail) >= 12 and tail[:8] == bytes(8) and struct.unpack_from("<I", tail, 8)[0] == ne:
-            tail_prefix = 8
-        if r.bytes(tail_prefix) != bytes(tail_prefix) or r.u32() != ne:
-            raise ValueError("Coda GEO non supportata (LOD, buffer o metadati aggiuntivi).")
-        for material, count in target.material_ids:
-            if (r.i32(), r.u32()) != (material, count):
-                raise ValueError("Gli elementi del buffer di rendering non corrispondono al GEO.")
-        blob, vb_magic, expanded_count, stride = r.u32(), r.u32(), r.u32(), r.u32()
-        if (vb_magic, stride) not in ((0, 20), (2, 32), (5, 32), (6, 44), (8, 44)) or blob != 8 + expanded_count * stride:
-            raise ValueError("Formato del buffer di rendering non supportato.")
-        r.bytes(expanded_count * stride)
-        indices = r.u32()
-        index_bytes = indices == len(target.faces) * 6
-        if index_bytes:
-            indices //= 2
-        if indices != len(target.faces) * 3:
-            raise ValueError("Conteggio degli indici del buffer non valido.")
-        r.bytes(indices * 2)
-        if indices % 2:
-            r.bytes(2)
-        if r.pos != len(tail):
-            raise ValueError("Metadati GEO finali non supportati.")
-    result = bytearray(struct.pack("<11I", 1, version, flags, flags2, len(mesh.vertices),
-                                   len(mesh.vertices) if colors else 0, 1 if colors else 0,
-                                   len(mesh.uvs), len(elements), 0, 1))
-    for v in mesh.vertices + normals:
-        result.extend(struct.pack("<3f", *v))
-    if colors:
-        # Match Toolkit's position-based transfer; new positions receive neutral white.
-        color_map = {tuple(round(x, 5) for x in target.vertices[i]): raw[color_offset+i*4:color_offset+i*4+4]
-                     for i in range(color_count)}
-        for vertex in mesh.vertices:
-            result.extend(color_map.get(tuple(round(x, 5) for x in vertex), bytes((255, 255, 255, 255))))
-    for uv in mesh.uvs:
-        result.extend(struct.pack("<2f", *uv))
-    for material, count in elements:
-        result.extend(struct.pack("<Ii", count, material))
-    expanded, lookup, indices = [], {}, []
-    for face, uv_face in zip(mesh.faces, mesh.uv_indices):
-        result.extend(struct.pack("<6HI", *face, *uv_face, 1))
-        for pair in zip(face, uv_face):
-            if pair not in lookup:
-                lookup[pair] = len(expanded)
-                expanded.append(pair)
-            indices.append(lookup[pair])
-    if len(expanded) > 65536:
-        raise ValueError("Il buffer espanso per le cuciture UV supera 65536 vertici.")
-    result.extend(bytes(tail_prefix))
-    result.extend(struct.pack("<I", len(elements)))
-    for material, count in elements:
-        result.extend(struct.pack("<iI", material, count))
-    result.extend(struct.pack("<4I", 8 + len(expanded) * stride, vb_magic, len(expanded), stride))
-    for vi, ui in expanded:
-        n = (0.0, 0.0, 0.0) if vb_magic == 8 else normals[vi]
-        if stride == 20:
-            result.extend(struct.pack("<5f", *mesh.vertices[vi], *mesh.uvs[ui]))
-        else:
-            result.extend(struct.pack("<8f", *mesh.vertices[vi], *n, *mesh.uvs[ui]))
-        if stride == 44:
-            result.extend(bytes(12))
-    result.extend(struct.pack("<I", len(indices) * (2 if index_bytes else 1)))
-    result.extend(struct.pack("<" + "H" * len(indices), *indices))
-    if len(indices) % 2:
-        result.extend(bytes(2))
-    return bytes(result)
+    candidate = replace(mesh, normals=mesh.normals or _mesh_vertex_normals(mesh.vertices, mesh.faces))
+    return jade_mesh.build_replacement(raw, target, candidate)
 
 
 def _dds_payload_and_info(path: Path) -> tuple[bytes, int, int, str, bytes]:
@@ -3667,11 +3680,18 @@ class JadeToolkit(tk.Tk):
         ttk.Label(top, text="Mesh Editor", font=("TkDefaultFont", 14, "bold")).pack(side="left")
         ttk.Button(top, text="Scan selected .wow / asset", command=self.scan_meshes).pack(side="right")
         ttk.Button(top, text="Export mesh", command=self.export_mesh).pack(side="right", padx=6)
-        ttk.Button(top, text="Import replacement GLB...", command=self.import_swap_mesh).pack(side="right", padx=6)
+        ttk.Button(top, text="Import GLB / OBJ...", command=self.import_swap_mesh).pack(side="right", padx=6)
         ttk.Button(top, text="Apply mesh changes", command=self.apply_mesh_changes, style="Apply.TButton").pack(side="right", padx=6)
         self.mesh_source_label = ttk.Label(self.mesh_tab, text="Nessun mesh analizzato")
         self.mesh_source_label.pack(anchor="w", pady=(4, 8))
 
+        options = ttk.Frame(self.mesh_tab)
+        options.pack(fill="x", pady=(0, 6))
+        self._mesh_fit_target = tk.BooleanVar(value=False)
+        ttk.Checkbutton(options, text="Adatta dimensione e centro alla mesh originale", variable=self._mesh_fit_target).pack(side="left")
+        ttk.Label(options, text="Assi OBJ (prima di importare):").pack(side="left", padx=(16, 4))
+        self._mesh_obj_axes = tk.StringVar(value="Auto")
+        ttk.Combobox(options, textvariable=self._mesh_obj_axes, values=("Auto", "Jade Z-up", "glTF Y-up"), state="readonly", width=13).pack(side="left")
         split = ttk.Panedwindow(self.mesh_tab, orient="horizontal")
         split.pack(fill="both", expand=True)
         left = ttk.Frame(split, padding=(0, 0, 8, 0))
@@ -3682,8 +3702,8 @@ class JadeToolkit(tk.Tk):
         ttk.Label(left, text="Mesh nel file selezionato").pack(anchor="w")
         mesh_tree_frame = ttk.Frame(left)
         mesh_tree_frame.pack(fill="both", expand=True, pady=(5, 0))
-        self.mesh_tree = ttk.Treeview(mesh_tree_frame, columns=("name", "verts", "faces", "key"), show="headings")
-        for c, t, w in (("name", "Mesh", 190), ("verts", "Vertices", 80), ("faces", "Faces", 80), ("key", "Mesh ID", 105)):
+        self.mesh_tree = ttk.Treeview(mesh_tree_frame, columns=("name", "verts", "faces", "key", "kind"), show="headings")
+        for c, t, w in (("name", "Mesh", 190), ("verts", "Vertices", 80), ("faces", "Faces", 80), ("key", "Mesh ID", 105), ("kind", "Tipo", 120)):
             self.mesh_tree.heading(c, text=t)
             self.mesh_tree.column(c, width=w, anchor="w")
         self.mesh_tree.pack(side="left", fill="both", expand=True)
@@ -3715,8 +3735,9 @@ class JadeToolkit(tk.Tk):
             self.mesh_canvas.bind("<Configure>", lambda _e: self._schedule_mesh_render())
             self.swap_mesh_canvas = tk.Label(replacement_box, text="OpenGL non disponibile", anchor="center")
             self.swap_mesh_canvas.pack(fill="both", expand=True)
-        self.swap_mesh_info = ttk.Label(replacement_box, text="Importa un GLB per visualizzare la mesh candidata allo swap.", justify="left")
+        self.swap_mesh_info = ttk.Label(replacement_box, text="Importa un GLB o OBJ. Per i character vengono trasferiti automaticamente rig e pesi BF.", justify="left", wraplength=750)
         self.swap_mesh_info.pack(anchor="w", pady=(6, 0))
+        replacement_box.bind("<Configure>", lambda e: self.swap_mesh_info.configure(wraplength=max(250, e.width - 24)))
 
         info_box = ttk.LabelFrame(right, text="Mesh info", padding=8)
         info_box.pack(fill="x", pady=(8, 0))
@@ -4460,7 +4481,7 @@ class JadeToolkit(tk.Tk):
             for i, mesh in enumerate(meshes):
                 name = mesh.object_name or f"Mesh #{i + 1}"
                 self.mesh_tree.insert("", "end", iid=f"mesh_{i}",
-                                      values=(name, f"{len(mesh.vertices):,}", f"{len(mesh.faces):,}", f"0x{mesh.key:08X}"))
+                                      values=(name, f"{len(mesh.vertices):,}", f"{len(mesh.faces):,}", f"0x{mesh.key:08X}", mesh.layout_name or "Prototipo"))
             missing_note = f" - {unresolved} texture non risolte" if unresolved else ""
             self.mesh_source_label.config(text=(f"{asset.name} - {len(meshes)} mesh visualizzabili, "
                                                 f"{len(images)} texture materiali risolte{missing_note}"))
@@ -4484,13 +4505,13 @@ class JadeToolkit(tk.Tk):
     def import_swap_mesh(self) -> None:
         source = filedialog.askopenfilename(
             title="Import replacement mesh",
-            filetypes=[("glTF Binary", "*.glb"), ("All files", "*.*")]
+            filetypes=[("Mesh 3D", "*.glb *.obj"), ("glTF Binary", "*.glb"), ("Wavefront OBJ", "*.obj")]
         )
         if not source:
             return
         try:
             path = Path(source)
-            mesh, textures, material_textures, material_colors = _load_glb_mesh_for_swap(path)
+            mesh, textures, material_textures, material_colors = _load_mesh_for_swap(path, self._mesh_obj_axes.get())
             self._swap_mesh = mesh
             self._swap_mesh_path = path
             self._swap_mesh_textures = textures
@@ -4501,7 +4522,9 @@ class JadeToolkit(tk.Tk):
             self.swap_mesh_info.config(text=(
                 f"{path.name} - {len(mesh.vertices):,} vertices - {len(mesh.faces):,} faces - "
                 f"{len(material_colors)} materiali - {len(textures)} texture\n"
-                "Trasformazioni, gerarchie e mesh della scena GLB sono state convertite automaticamente negli assi Jade. Apply mesh changes mantiene i materiali BF; texture GLB solo in anteprima."
+                f"{mesh.layout_name}; {len(mesh.source_joint_names)} joint sorgente. "
+                "Materiali/texture importati solo in anteprima; Apply mantiene quelli BF. "
+                "Character BF: rig originale e pesi ricalcolati per prossimita. Destinazione statica: sola geometria. Esportare in posa di riposo."
             ))
             self._log(f"OK    Mesh replacement import: {path.name} -> {len(mesh.vertices)} vertici, {len(mesh.faces)} facce")
         except Exception as exc:
@@ -4510,7 +4533,7 @@ class JadeToolkit(tk.Tk):
             self._swap_mesh_textures = {}
             self._swap_mesh_material_textures = {}
             self._swap_mesh_material_colors = {}
-            self.swap_mesh_info.config(text=f"Import GLB non riuscito: {exc}")
+            self.swap_mesh_info.config(text=f"Import mesh non riuscito: {exc}")
             self._log(f"ERROR Mesh replacement import: {exc}")
             messagebox.showerror("Import replacement mesh", str(exc))
 
@@ -4518,7 +4541,7 @@ class JadeToolkit(tk.Tk):
         target = self._selected_mesh()
         asset = self._mesh_source_asset
         if target is None or asset is None or self._swap_mesh is None:
-            messagebox.showinfo("Mesh Swap", "Scansiona e seleziona una mesh, poi importa il GLB.")
+            messagebox.showinfo("Mesh Swap", "Scansiona e seleziona una mesh, poi importa un GLB o OBJ.")
             return False
         if not any(a is asset for a in self.project.assets):
             messagebox.showerror("Mesh Swap", "Il progetto è cambiato: riscansiona l'asset.")
@@ -4529,8 +4552,9 @@ class JadeToolkit(tk.Tk):
             entry = entries[target.entry_index]
             if entry.key != target.key:
                 raise ValueError("La selezione non corrisponde più all'asset: riscansiona.")
-            replacement = _build_static_mesh_replacement(data, target, self._swap_mesh)
-            updates = _mesh_rli_replacements(data, target, self._swap_mesh)
+            candidate = jade_mesh.fitted_mesh(self._swap_mesh, target) if self._mesh_fit_target.get() else self._swap_mesh
+            replacement = _build_static_mesh_replacement(data, target, candidate)
+            updates = _mesh_rli_replacements(data, target, candidate)
             updates[entry.index] = replacement
             patched = data
             for index, payload in sorted(updates.items(), reverse=True):
@@ -4553,11 +4577,12 @@ class JadeToolkit(tk.Tk):
             self._mesh_infos = meshes
             for i, mesh in enumerate(meshes):
                 self.mesh_tree.item(f"mesh_{i}", values=(mesh.object_name or f"Mesh #{i + 1}",
-                    f"{len(mesh.vertices):,}", f"{len(mesh.faces):,}", f"0x{mesh.key:08X}"))
+                    f"{len(mesh.vertices):,}", f"{len(mesh.faces):,}", f"0x{mesh.key:08X}", mesh.layout_name or "Prototipo"))
             self.on_mesh_selected()
             self.status.set("Mesh applicata in memoria. Salva il BF/BIN/DEC per scriverla su disco.")
             self.mesh_source_label.config(text=f"{asset.name} - mesh applicate in memoria, pronte al salvataggio")
-            self._log(f"APPLY Mesh 0x{target.key:08X}: {len(updated.vertices)} vertici, {len(updated.faces)} facce")
+            self._log(f"APPLY Mesh 0x{target.key:08X}: {len(updated.vertices)} vertici, {len(updated.faces)} facce; "
+                      f"{len(updated.skin_bones or [])} ossa BF conservate, pesi trasferiti automaticamente")
             return True
         except Exception as exc:
             self._log(f"ERROR Mesh apply: {exc}")
@@ -4580,7 +4605,7 @@ class JadeToolkit(tk.Tk):
             return
         self.mesh_info.config(text=(
             f"Mesh ID 0x{mesh.key:08X} • {len(mesh.vertices):,} vertices • {len(mesh.faces):,} faces • "
-            f"version {mesh.version}" + (f" • object: {mesh.object_name}" if mesh.object_name else "")
+            f"version {mesh.version} / {mesh.layout_name or 'layout prototipo'} / {len(mesh.skin_bones or [])} ossa" + (f" • object: {mesh.object_name}" if mesh.object_name else "")
         ))
         if OpenGLFrame is not None and isinstance(self.mesh_canvas, MeshViewport):
             texture_map = self._mesh_material_textures_by_mesh.get(mesh.key, {})

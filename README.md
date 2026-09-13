@@ -23,6 +23,12 @@ Unlike generic hex editors or simple string parsers, **PoP BF Lab** natively dec
 * **In-Memory Decompression:** Automatic detection and decompression of LZO-wrapped data blocks (e.g., `Univers_oin_*.bin`).
 * **Binary Diff Utility:** Built-in tool to compare two binary dumps and map structural byte variations instantly.
 
+### Advanced mesh import (GLB / OBJ)
+
+Mesh Editor now distinguishes static geometry from characters and supports GLB and OBJ replacements. Character swaps retain the original BF skeleton links and bind matrices and automatically transfer vertex weights to the new topology. Retail GEO and cooked rendering buffers are rebuilt together, including native Jade skin weights and supported StaticLOD references.
+
+See [mesh import workflow, validation and limitations](docs/MESH_IMPORT.md). Structural tests passed with a Blender cube on 264 meshes across SOT, WW and T2T; in-game rendering and animation still require validation.
+
 ### Texture Swap: automatic conversion and dump
 
 The Texture Swap tab includes **Dump texture**, which writes the selected texture beside the source `.bf` without changing its embedded compressed payload. DDS/DXT5 textures keep their original mipmap count and payload size.

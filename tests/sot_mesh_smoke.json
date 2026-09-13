@@ -1,0 +1,38 @@
+{
+  "bf": "SOT_FULL_GAME_windows.bf",
+  "asset": "0101_Entree_wow_ff02b4f9.bin",
+  "glb": "Untitled.glb",
+  "candidate_vertices": 24,
+  "candidate_faces": 12,
+  "mesh_count": 214,
+  "passed": {
+    "static": 203,
+    "character": 11
+  },
+  "cooked_strides": {
+    "20": 180,
+    "32": 12,
+    "52": 5,
+    "no cooked": 17
+  },
+  "errors": [],
+  "full_asset_roundtrips": [
+    {
+      "kind": "static",
+      "key": "13005844",
+      "bones": 0,
+      "modified_resources": 1,
+      "unrelated_resources_identical": true,
+      "lzo_roundtrip": true
+    },
+    {
+      "kind": "character",
+      "key": "1A002722",
+      "bones": 22,
+      "modified_resources": 1,
+      "unrelated_resources_identical": true,
+      "lzo_roundtrip": true
+    }
+  ],
+  "game_runtime_tested": false
+}

@@ -1,0 +1,37 @@
+{
+  "bf": "T2T_FULL_GAME_windows.bf",
+  "asset": "PrinceFinal_Shape_wow_ff051dec.bin",
+  "glb": "Untitled.glb",
+  "candidate_vertices": 24,
+  "candidate_faces": 12,
+  "mesh_count": 9,
+  "passed": {
+    "static": 7,
+    "character": 2
+  },
+  "cooked_strides": {
+    "no cooked": 5,
+    "52": 2,
+    "32": 2
+  },
+  "errors": [],
+  "full_asset_roundtrips": [
+    {
+      "kind": "static",
+      "key": "5C004E1D",
+      "bones": 0,
+      "modified_resources": 1,
+      "unrelated_resources_identical": true,
+      "lzo_roundtrip": false
+    },
+    {
+      "kind": "character",
+      "key": "510022D3",
+      "bones": 45,
+      "modified_resources": 1,
+      "unrelated_resources_identical": true,
+      "lzo_roundtrip": false
+    }
+  ],
+  "game_runtime_tested": false
+}
