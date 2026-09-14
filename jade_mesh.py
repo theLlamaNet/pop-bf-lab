@@ -31,19 +31,19 @@ class GeoLayout:
 
 def read_layout(raw):
     if len(raw) < 44:
-        raise ValueError('Header GEO troncato.')
+        raise ValueError('Truncated GEO header.')
     h = struct.unpack_from('<10I', raw)
     if h[0] != 1 or h[1] not in (7, 8):
-        raise ValueError('Layout GEO retail v7/v8 richiesto.')
+        raise ValueError('Retail GEO v7/v8 layout required.')
     nv, nc, colors, nu, ne, marker = h[4:]
     if not 0 < nv <= 500000 or nu > 1000000 or ne > 4096:
-        raise ValueError('Conteggi GEO non validi.')
+        raise ValueError('Invalid GEO counts.')
     pos = 40
     def take(fmt):
         nonlocal pos
         size = struct.calcsize(fmt)
         if pos + size > len(raw):
-            raise ValueError('Blocco GEO/skin troncato.')
+            raise ValueError('Truncated GEO/skin block.')
         values = struct.unpack_from(fmt, raw, pos)
         pos += size
         return values
@@ -51,24 +51,24 @@ def read_layout(raw):
     if marker == 0xC0DE2002:
         skin_flags, nb = take('<HH')
         if nb > 4096:
-            raise ValueError('Numero di ossa GEO non valido.')
+            raise ValueError('Invalid GEO bone count.')
         seen = set()
         for _ in range(nb):
             index, count = take('<HH')
             matrix = take('<16f')
             matrix_type, = take('<i')
             if index in seen or not all(math.isfinite(x) for x in matrix):
-                raise ValueError('Matrice skin duplicata o non valida.')
+                raise ValueError('Duplicate or invalid skin matrix.')
             seen.add(index)
             weights = [take('<HH') for _ in range(count)]
             if any(v >= nv for v, w in weights):
-                raise ValueError('Indice vertice skin fuori intervallo.')
+                raise ValueError('Skin vertex index is out of range.')
             bones.append(SkinBone(index, matrix, matrix_type, weights))
     elif marker != 0:
-        raise ValueError(f'Metadati MRM 0x{marker:08X} non riconosciuti: sostituzione annullata.')
+        raise ValueError(f'Unrecognized MRM metadata 0x{marker:08X}: replacement cancelled.')
     has_normals, = take('<I')
     if has_normals not in (0, 1):
-        raise ValueError('Indicatore normali GEO non riconosciuto.')
+        raise ValueError('Unrecognized GEO normals flag.')
     vertex_offset = pos
     color_offset = pos + nv * 12 * (2 if has_normals else 1)
     pos = color_offset + (min(nv, nc) * 4 if colors else 0) + nu * 8
@@ -77,7 +77,7 @@ def read_layout(raw):
         count, material = take('<Ii')
         nf += count
     if nf > 2000000 or pos + nf * 16 > len(raw):
-        raise ValueError('Triangoli GEO troncati.')
+        raise ValueError('Truncated GEO triangles.')
     return GeoLayout(h, vertex_offset, color_offset, pos + nf * 16,
                      bool(has_normals), skin_flags, bones)
 
@@ -118,7 +118,7 @@ def read_cooked(raw, layout, elements, face_count):
         return dict(prefix=prefix, magic=magic, stride=stride,
                     index_bytes=ni == face_count * 6, padding=len(tail)-end,
                     count=count, vertices=tail[vb_start:vb_start+count*stride])
-    raise ValueError('Coda GEO non riconosciuta (LOD/MRM, elementi o buffer): nessun dato modificato.')
+    raise ValueError('Unrecognized GEO tail (LOD/MRM, elements or buffers): no data changed.')
 
 
 class NearestPoints:
@@ -155,7 +155,7 @@ def decode_weight(word):
     # with the vertex index. The second ushort is float bits, NOT UNORM16.
     value = struct.unpack("<f", struct.pack("<I", word << 16))[0]
     if not math.isfinite(value) or not 0 <= value <= 1.01:
-        raise ValueError("Ponderazione Jade non valida (float compresso a 16 bit).")
+        raise ValueError("Invalid Jade weight (16-bit compressed float).")
     return value
 
 
@@ -172,7 +172,7 @@ def transfer_skin(bones, old_vertices, new_vertices, max_influences=None):
                 influences[vi][bi] = influences[vi].get(bi, 0.0) + weight
     valid = [i for i,v in enumerate(influences) if v]
     if not valid:
-        raise ValueError('La skin originale non contiene pesi utilizzabili.')
+        raise ValueError('The original skin contains no usable weights.')
     tree = NearestPoints(old_vertices, valid)
     result = [replace(b, weights=[]) for b in bones]
     cache = {}
@@ -201,7 +201,7 @@ def pack_skin(flags, bones):
     data = bytearray(struct.pack('<HH', flags, len(bones)))
     for bone in bones:
         if len(bone.weights) > 65535:
-            raise ValueError('Troppi vertici assegnati alla stessa matrice skin.')
+            raise ValueError('Too many vertices assigned to the same skin matrix.')
         data.extend(struct.pack('<HH16fi', bone.index, len(bone.weights), *bone.matrix, bone.matrix_type))
         for vi,w in bone.weights: data.extend(struct.pack('<HH', vi,w))
     return data
@@ -239,14 +239,14 @@ def fitted_mesh(mesh, target):
     center, extent = bounds(mesh.vertices)
     target_center, target_extent = bounds(target.vertices)
     if extent < 1e-15 or target_extent < 1e-15:
-        raise ValueError('Impossibile adattare una mesh di dimensione nulla.')
+        raise ValueError('Cannot fit a zero-size mesh.')
     scale = target_extent/extent
     return replace(mesh, vertices=[tuple((p[k]-center[k])*scale+target_center[k] for k in range(3)) for p in mesh.vertices])
 
 
 def triangulate_polygon(points):
     """Ear clipping for simple planar OBJ n-gons (including concave faces)."""
-    if len(points) < 3: raise ValueError('Faccia OBJ con meno di tre vertici.')
+    if len(points) < 3: raise ValueError('OBJ face has fewer than three vertices.')
     normal = [sum((p[(k+1)%3]-q[(k+1)%3])*(p[(k+2)%3]+q[(k+2)%3])
                   for p,q in zip(points, points[1:]+points[:1])) for k in range(3)]
     drop = max(range(3), key=lambda k: abs(normal[k]))
@@ -256,7 +256,7 @@ def triangulate_polygon(points):
     eps = max(span*span*1e-12,1e-30)
     def cross(a,b,c): return (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])
     area = sum(p[0]*q[1]-q[0]*p[1] for p,q in zip(xy,xy[1:]+xy[:1]))
-    if abs(area) <= eps: raise ValueError('Faccia OBJ degenere.')
+    if abs(area) <= eps: raise ValueError('Degenerate OBJ face.')
     sign = 1 if area > 0 else -1
     remaining = list(range(len(points))); result = []
     while len(remaining) > 3:
@@ -266,7 +266,7 @@ def triangulate_polygon(points):
             if any(all(sign*cross(xy[u],xy[v],xy[p]) >= -eps for u,v in ((a,b),(b,c),(c,a)))
                    for p in remaining if p not in (a,b,c)): continue
             result.append((a,b,c)); remaining.pop(j); break
-        else: raise ValueError('Poligono OBJ non triangolabile: controllare vertici duplicati o auto-intersezioni.')
+        else: raise ValueError('Cannot triangulate OBJ polygon: check for duplicate vertices or self-intersections.')
     result.append(tuple(remaining))
     return result
 
@@ -275,30 +275,30 @@ def build_replacement(raw, target, mesh):
     layout = read_layout(raw)
     kind, version, flags, flags2, nv, nc, colors, nu, ne, marker = layout.header
     if (nv,nu,ne) != (len(target.vertices),len(target.uvs),len(target.material_ids)):
-        raise ValueError('La geometria sorgente e la selezione non corrispondono: riscansionare.')
+        raise ValueError('The source geometry and the selection do not match: rescan.')
     if not 1 <= len(mesh.vertices) <= 32768 or not 1 <= len(mesh.uvs) <= 32768:
-        raise ValueError('Jade supporta fino a 32768 vertici e UV nella geometria primaria.')
+        raise ValueError('Jade supports up to 32768 vertices and UVs in primary geometry.')
     for values,size in ((mesh.vertices,3),(mesh.uvs,2),(mesh.normals or [],3)):
         if any(len(v)!=size or any(not math.isfinite(x) or abs(x)>3.4e38 for x in v) for v in values):
-            raise ValueError('Coordinate o normali non valide per float32.')
+            raise ValueError('Coordinates or normals are invalid for float32.')
     if not mesh.faces or len(mesh.faces)!=len(mesh.uv_indices):
-        raise ValueError('Facce o indici UV mancanti.')
+        raise ValueError('Missing faces or UV indices.')
     for faces,count in ((mesh.faces,len(mesh.vertices)),(mesh.uv_indices,len(mesh.uvs))):
         if any(len(f)!=3 or any(not isinstance(i,int) or not 0<=i<count for i in f) for f in faces):
-            raise ValueError('Indici triangolari fuori intervallo.')
+            raise ValueError('Triangle indices are out of range.')
     if not target.material_ids or not mesh.material_ids or any(c<=0 for _,c in mesh.material_ids) or sum(c for _,c in mesh.material_ids)!=len(mesh.faces):
-        raise ValueError('Slot materiale/conteggi delle primitive non validi.')
+        raise ValueError('Invalid material slots/primitive counts.')
     counts = [c for _,c in mesh.material_ids]
     if len(counts)>ne: counts=counts[:ne-1]+[sum(counts[ne-1:])]
     elements=[(mat, counts[i] if i<len(counts) else 0) for i,(mat,_) in enumerate(target.material_ids)]
     normals = mesh.normals
     if normals is None or len(normals)!=len(mesh.vertices):
-        raise ValueError('Una normale per vertice e richiesta prima della serializzazione.')
+        raise ValueError('One normal per vertex is required before serialization.')
     normals=[tuple(x/length for x in n) if (length:=math.hypot(*n))>1e-20 else (0.0,0.0,1.0) for n in normals]
     cooked=read_cooked(raw,layout,target.material_ids,len(target.faces))
     bones=layout.bones
     if cooked and cooked['magic']==3 and not bones:
-        raise ValueError('Buffer skinned senza associazioni alle ossa.')
+        raise ValueError('Skinned buffer has no bone assignments.')
     if bones:
         bones=transfer_skin(bones,target.vertices,mesh.vertices,3 if cooked and cooked['magic']==3 else None)
     result=bytearray(struct.pack('<10I',kind,version,flags,flags2,len(mesh.vertices),
@@ -319,7 +319,7 @@ def build_replacement(raw, target, mesh):
             if pair not in lookup:
                 lookup[pair]=len(expanded); expanded.append(pair)
             indices.append(lookup[pair])
-    if len(expanded)>65536: raise ValueError('Le cuciture UV superano 65536 vertici nel buffer espanso.')
+    if len(expanded)>65536: raise ValueError('UV seams exceed 65536 vertices in the expanded buffer.')
     if cooked is None:
         result.extend(raw[layout.body_end:])
     else:
@@ -327,7 +327,7 @@ def build_replacement(raw, target, mesh):
         tangents=vertex_tangents(mesh,normals) if stride in (44,64) else None
         influences=[[] for _ in mesh.vertices]
         for b in bones:
-            if magic==3 and b.index*3>65535: raise ValueError('ID matrice fuori intervallo per il buffer skin.')
+            if magic==3 and b.index*3>65535: raise ValueError('Matrix ID is out of range for the skin buffer.')
             for vi,w in b.weights: influences[vi].append((b.index,decode_weight(w)))
         result.extend(bytes(cooked['prefix']))
         result.extend(struct.pack('<I',ne))
@@ -338,7 +338,7 @@ def build_replacement(raw, target, mesh):
             if magic==3:
                 inf=sorted(influences[vi],key=lambda p:(-p[1],p[0]))[:3]
                 total=sum(w for _,w in inf)
-                if not total: raise ValueError('Vertice senza pesi dopo il trasferimento skin.')
+                if not total: raise ValueError('Vertex has no weights after skin transfer.')
                 ids=[bi*3 for bi,w in inf]+[0]*4
                 weights=[w/total for bi,w in inf]+[0.0]*3
                 result.extend(struct.pack('<6f4H5f',*v,*n,*ids[:4],*weights[:3],*uv))
@@ -356,5 +356,5 @@ def build_replacement(raw, target, mesh):
     checked=read_layout(rebuilt)
     read_cooked(rebuilt,checked,elements,len(mesh.faces))
     if [(b.index,b.matrix,b.matrix_type) for b in checked.bones] != [(b.index,b.matrix,b.matrix_type) for b in layout.bones]:
-        raise ValueError('Verifica delle matrici skin fallita.')
+        raise ValueError('Skin matrix verification failed.')
     return rebuilt

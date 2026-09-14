@@ -87,6 +87,44 @@ shared package.
 
 For development, `pop_bf_lab.py` can still be run with a compatible local Python 3.11 installation.
 
+### Source layout
+
+The interface, diagnostics, logs and launcher messages are in English. The application is split by
+responsibility; `pop_bf_lab.py` remains the launcher and re-exports the existing Python API for
+scripts that already import it.
+
+| File / directory | Responsibility |
+| --- | --- |
+| `bf_lab/config.py`, `bf_lab/models.py` | Installation paths, binary constants and shared data models |
+| `bf_lab/resources.py`, `bf_lab/archives.py`, `bf_lab/lzo.py` | POP resource streams, BF extraction/rebuilding and compression |
+| `bf_lab/ova.py` | OVA descriptors, variables and diagnostics |
+| `bf_lab/mesh_parser.py`, `bf_lab/mesh_import.py`, `jade_mesh.py` | Native meshes, GLB/OBJ import and GEO/skin serialization |
+| `bf_lab/textures.py`, `bf_lab/materials.py` | Texture codecs and material records |
+| `bf_lab/project.py` | Opened project and staged changes |
+| `bf_lab/viewports.py` | Optional OpenGL viewports |
+| `bf_lab/ui/app.py` | Main window, theme, menus and shared controls |
+| `bf_lab/ui/assets.py`, `repack.py`, `ova.py`, `mesh.py`, `material.py`, `texture.py` | Feature panels and their actions |
+
+The UI panels are mixins composed into `JadeToolkit`, preserving the shared project state and
+existing callbacks. Core modules can also be imported directly, for example
+`from bf_lab.archives import read_bigfile`. Dependencies in `vendor/`, the Python runtime and LZO
+helpers are resolved relative to the installation directory. Include the entire `bf_lab/` directory
+when sharing the application.
+
+Run the automated regression tests with the bundled interpreter:
+
+```text
+runtime\python311\python.exe -B -m unittest discover -s tests -v
+```
+
+Run the hidden Tkinter integration smoke test on a Windows desktop:
+
+```text
+runtime\python311\python.exe -B tests\ui_smoke.py
+```
+
+These checks use synthetic fixtures and temporary output files; they do not modify game archives.
+
 ---
 
 ## Research & Use Cases

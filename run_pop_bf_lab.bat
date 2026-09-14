@@ -5,7 +5,7 @@ set "PYTHON_RUNTIME=%APP_ROOT%runtime\python311\pythonw.exe"
 set "APP_SCRIPT=%APP_ROOT%pop_bf_lab.py"
 
 if not exist "%PYTHON_RUNTIME%" (
-    echo PoP BF Lab: Python 3.11 embedded runtime non trovato.
+    echo PoP BF Lab: Python 3.11 embedded runtime not found.
     echo Expected: "%PYTHON_RUNTIME%"
     pause
     exit /b 1
