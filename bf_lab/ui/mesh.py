@@ -22,6 +22,7 @@ from ..mesh_import import (
     _mesh_rli_replacements,
 )
 from ..mesh_uv import _jade_uv_to_standard
+from ..mesh_export import _mesh_obj_lines
 from ..mesh_parser import _scan_pop_meshes
 from ..models import (
     Asset,
@@ -595,24 +596,7 @@ class MeshEditorMixin:
                 mtl_lines.append("")
             mtl_path.write_text("\n".join(mtl_lines), encoding="utf-8")
 
-            lines = [f"# Exported by PoP BF Lab", f"mtllib {mtl_path.name}"]
-            for x, y, z in mesh.vertices:
-                lines.append(f"v {x:.8g} {y:.8g} {z:.8g}")
-            for u, v in mesh.uvs:
-                obj_u, obj_v = _jade_uv_to_standard((u, v))
-                lines.append(f"vt {obj_u:.8g} {obj_v:.8g}")
-            current_face = 0
-            for mat_id, count in mesh.material_ids:
-                lines.append(f"usemtl mat_{mat_id}")
-                for face_index in range(current_face, min(current_face + count, len(mesh.faces))):
-                    face = mesh.faces[face_index]
-                    if mesh.uv_indices and face_index < len(mesh.uv_indices):
-                        uvf = mesh.uv_indices[face_index]
-                        refs = [f"{vi + 1}/{ui + 1}" for vi, ui in zip(face, uvf)]
-                    else:
-                        refs = [str(vi + 1) for vi in face]
-                    lines.append("f " + " ".join(refs))
-                current_face += count
+            lines = _mesh_obj_lines(mesh, mtl_path.name)
             obj_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
             self._log(f"OK    Mesh export: {obj_path}")
             messagebox.showinfo("Export mesh", f"Created in the source folder:\n{obj_path}\n{mtl_path}\n{len(textures_out)} PNG textures")

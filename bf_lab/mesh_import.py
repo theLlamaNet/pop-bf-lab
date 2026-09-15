@@ -386,7 +386,9 @@ def _load_obj_mesh_for_swap(path: Path, axes: str = "Jade Z-up"):
     vertices, normals, faces, uv_faces, materials = [], [], [], [], []
     lookup, material_lookup, libraries = {}, {}, []
     material = 0
-    smoothing = "off"
+    # Old Lab exports omitted vn and s despite sharing smooth native vertices.
+    # Keep the OBJ default for other producers and honor explicit s commands.
+    smoothing = "1" if text.splitlines()[:1] == ["# Exported by PoP BF Lab"] else "off"
     groups = []
     def index(value, count):
         n = int(value)

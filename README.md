@@ -29,6 +29,14 @@ Mesh Editor now distinguishes static geometry from characters and supports GLB a
 
 See [mesh import workflow, validation and limitations](docs/MESH_IMPORT.md). Structural tests passed with a Blender cube on 264 meshes across SOT, WW and T2T; in-game rendering and animation still require validation.
 
+### OBJ shading and texture orientation
+
+OBJ exports include native vertex normals and smoothing, preserving smooth shading through export, reimport, preview and native mesh replacement. Existing Lab OBJ exports without normals recover smoothing from shared vertex indices; export again from the original BF to preserve the exact original normals. Explicit hard edges in imported OBJ files remain supported.
+
+Raw, PAL8 and 4-bit texture previews/exports now use the same top-left row order as DDS. This fixes vertically inverted textures on affected SOT meshes without changing native UV coordinates. Restart the application and export fresh OBJ/PNG files to use both fixes.
+
+Validation: seven regression tests (`runtime/python311/python.exe -B -m unittest discover -s tests -v`); Mahasti head roundtrip retains 351 vertices, 622 faces and 18 bones; five SOT costume meshes retain normals in rebuilt rendering buffers, and the SOT costume PAL8 image matches the native row order. In-game visual validation remains pending.
+
 ### Texture Swap: automatic conversion and dump
 
 The Texture Swap tab includes **Dump texture**, which writes the selected texture beside the source `.bf` without changing its embedded compressed payload. DDS/DXT5 textures keep their original mipmap count and payload size.

@@ -437,13 +437,14 @@ def _build_tga_header(width: int, height: int, pixel_depth: int = 32) -> bytes:
         raise ValueError(f"Invalid TGA dimensions: {width}x{height}.")
     if pixel_depth not in (24, 32):
         raise ValueError(f"Unsupported TGA depth: {pixel_depth} bits.")
-    # Uncompressed true-color, bottom-left origin. The embedded POP payload is
-    # already pixel data, so no external tga_header.bin is required.
+    # Jade raw/palette rows have the same top-left origin as DDS and our
+    # encoders. Bottom-left here flips only these formats during decoding.
     header = bytearray(18)
     header[2] = 2
     struct.pack_into("<H", header, 12, width)
     struct.pack_into("<H", header, 14, height)
     header[16] = pixel_depth
+    header[17] = 0x20 | (8 if pixel_depth == 32 else 0)
     return bytes(header)
 
 
