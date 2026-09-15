@@ -608,3 +608,39 @@ def _palette_payload_from_file(path: Path, texture: TextureInfo, palette: bytes,
     return _palette_payload_from_image(
         _image_rgba(path, texture.width, texture.height), texture, palette, original_payload
     )
+
+
+def _texture_replacement_from_file(path: Path, texture: TextureInfo, original: bytes,
+                                   keep_dimensions: bool = False) -> tuple[bytes, int, int, int]:
+    """Encode a replacement and report the dimensions used by its pixel data."""
+    from PIL import Image
+
+    target_type = 7 if texture.texture_type == 1 else texture.texture_type
+    if target_type not in (0, 5, 7):
+        raise ValueError(f"Unsupported POP texture format: type {texture.texture_type}.")
+    width, height = texture.width, texture.height
+    if keep_dimensions:
+        with Image.open(path) as image:
+            width, height = image.size
+        if not (1 <= width <= 8192 and 1 <= height <= 8192):
+            raise ValueError("POP texture dimensions must be between 1 and 8192 pixels.")
+    if (width, height) != (texture.width, texture.height):
+        image = _image_rgba(path, width, height)
+        # A changed surface gets a new base level; old mips/padding describe
+        # the old dimensions and cannot be appended to the resized texture.
+        if target_type == 5:
+            payload = _encode_dxt1(image)
+        elif target_type == 7:
+            payload = _encode_dxt5(image, 1)
+        else:
+            is_bgr24 = texture.data_end - texture.data_offset == texture.width * texture.height * 3
+            payload = image.convert("RGB").tobytes("raw", "BGR") if is_bgr24 else image.tobytes("raw", "BGRA")
+    elif texture.texture_type == 7:
+        payload = _dds_payload_from_file(path, texture, original)
+    elif texture.texture_type == 5:
+        payload = _dxt1_payload_from_file(path, texture)
+    elif texture.texture_type == 1:
+        payload = _dxt5_payload_for_converted_texture(path, texture)
+    else:
+        payload = _tga_payload_from_file(path, texture, original)
+    return payload, target_type, width, height

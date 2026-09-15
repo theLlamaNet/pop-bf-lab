@@ -295,6 +295,8 @@ class RepackMixin:
                      if getattr(self, "_texture_patch_key", texture.key) == texture.key
                      else texture.texture_type),
                     texture.texture_type, texture.width, texture.height, bytes(self._texture_data),
+                    source_dimensions=(getattr(self, "_texture_patch_source_dimensions", None)
+                                       if getattr(self, "_texture_patch_key", None) == texture.key else None),
                 )
             except Exception as exc:
                 self._log(f"ERROR Save BF: {exc}")

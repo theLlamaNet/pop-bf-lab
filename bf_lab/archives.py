@@ -309,6 +309,7 @@ def _repack_legacy_bigfile(path: Path, selected: BigFileEntry, decoded_data: byt
     if info.version not in (37, 38):
         raise ValueError("Automatic BF rebuilding is implemented for v37/v38.")
     selected_payload = compress_pop_lzo(decoded_data) if selected.compressed else decoded_data
+    payloads: dict[int, bytes] = {}
     for entry in info.entries:
         if entry.index == selected.index:
             payloads[entry.index] = selected_payload
@@ -403,9 +404,13 @@ def _repack_legacy_bigfile_changes(path: Path, replacements: dict[int, bytes], o
 
 def _patch_texture_key_in_asset(asset_data: bytes, texture_key: int, replacement_payload: bytes,
                                 source_type: int, target_type: int,
-                                width: int, height: int) -> tuple[bytes, int]:
+                                width: int, height: int,
+                                replacement_dimensions: tuple[int, int] | None = None) -> tuple[bytes, int]:
     """Patch matching POP texture entries, rebuilding their header if needed."""
     data = bytearray(asset_data)
+    target_width, target_height = replacement_dimensions or (width, height)
+    if not (1 <= target_width <= 8192 and 1 <= target_height <= 8192):
+        raise ValueError("POP texture dimensions must be between 1 and 8192 pixels.")
     matches = 0
     try:
         textures = _scan_pop_textures(data)
@@ -417,15 +422,16 @@ def _patch_texture_key_in_asset(asset_data: bytes, texture_key: int, replacement
     for tex in reversed(textures):
         if tex.key != texture_key:
             continue
-        if tex.width != width or tex.height != height:
-            continue
         # The selected asset is already converted when saving a BF. Count it
         # without touching it, so it remains in the replacement set.
         if (tex.texture_type == target_type
+                and (tex.width, tex.height) == (target_width, target_height)
                 and bytes(data[tex.data_offset:tex.data_end]) == replacement_payload):
             matches += 1
             continue
         if tex.texture_type != source_type:
+            continue
+        if (tex.width, tex.height) != (width, height):
             continue
         # tex.offset is the FileEntry data start. The Jade texture header is
         # 56 B long here; types 1 and 5 have an additional four-byte prefix.
@@ -433,6 +439,9 @@ def _patch_texture_key_in_asset(asset_data: bytes, texture_key: int, replacement
         if header_end > tex.data_end:
             continue
         entry = bytearray(data[tex.offset:header_end])
+        if (target_width, target_height) != (tex.width, tex.height):
+            struct.pack_into("<hh", entry, 12, target_width, target_height)
+            struct.pack_into("<II", entry, 44, target_width, target_height)
         struct.pack_into("<I", entry, 40, target_type)
         # Match Jade Toolkit: replacements in DXT/BGRA formats carry just the
         # base level and reset Jade's mip-count field.
@@ -458,7 +467,8 @@ def _collect_texture_key_replacements(path: Path, selected: BigFileEntry,
                                       texture_key: int, replacement_payload: bytes,
                                       source_type: int, target_type: int,
                                       width: int, height: int,
-                                      selected_decoded: bytes) -> tuple[dict[int, bytes], list[str]]:
+                                      selected_decoded: bytes,
+                                      source_dimensions: tuple[int, int] | None = None) -> tuple[dict[int, bytes], list[str]]:
     """Find the same logical texture in other BF assets and patch all valid copies.
 
     Jade/POP assets can carry the same texture key in more than one container.
@@ -479,7 +489,8 @@ def _collect_texture_key_replacements(path: Path, selected: BigFileEntry,
             except Exception:
                 continue
         patched, count = _patch_texture_key_in_asset(
-            decoded, texture_key, replacement_payload, source_type, target_type, width, height
+            decoded, texture_key, replacement_payload, source_type, target_type,
+            *(source_dimensions or (width, height)), replacement_dimensions=(width, height),
         )
         if count:
             replacements[entry.index] = patched

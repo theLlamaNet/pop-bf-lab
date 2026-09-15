@@ -22,17 +22,13 @@ from ..textures import (
     _build_type7_dds,
     _compressed_dds_for_preview,
     _dds_blob_for_dump,
-    _dds_payload_from_file,
-    _dxt1_payload_from_file,
-    _dxt5_payload_for_converted_texture,
     _encode_dxt1,
     _encode_dxt5,
     _infer_dxt5_mip_count,
-    _palette_payload_from_file,
     _palette_payload_from_image,
     _scan_pop_textures,
-    _tga_payload_from_file,
     _transform_texture_image,
+    _texture_replacement_from_file,
 )
 
 
@@ -50,7 +46,13 @@ class TextureEditorMixin:
                                             style="Apply.TButton", state="disabled")
         self.texture_apply_btn.pack(side="right", padx=6)
         self.texture_source_label = ttk.Label(self.texture_tab, text="No textures scanned")
-        self.texture_source_label.pack(anchor="w", pady=(4, 8))
+        self.texture_source_label.pack(anchor="w", pady=(4, 4))
+        self.keep_imported_texture_dimensions = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self.texture_tab, text="Keep imported texture dimensions",
+            variable=self.keep_imported_texture_dimensions,
+            command=self._texture_dimensions_changed,
+        ).pack(anchor="w", pady=(0, 8))
         split = ttk.Panedwindow(self.texture_tab, orient="horizontal")
         split.pack(fill="both", expand=True)
         left = ttk.Frame(split, padding=(0, 0, 8, 0))
@@ -144,7 +146,8 @@ class TextureEditorMixin:
     def _tga_blob_for_texture(self, tex: TextureInfo) -> bytes:
         payload = bytes(self._texture_data[tex.data_offset:tex.data_end])
         if tex.texture_type == 0:
-            return _build_tga_header(tex.storage_width, tex.storage_height, 32) + payload[:tex.storage_width * tex.storage_height * 4]
+            depth = 24 if len(payload) == tex.storage_width * tex.storage_height * 3 else 32
+            return _build_tga_header(tex.storage_width, tex.storage_height, depth) + payload[:tex.storage_width * tex.storage_height * (depth // 8)]
         return _build_tga_header(tex.storage_width, tex.storage_height, 32) + payload
 
     def _palette_tga_blob_for_texture(self, tex: TextureInfo) -> bytes:
@@ -247,27 +250,28 @@ class TextureEditorMixin:
             return
         try:
             from PIL import Image, ImageTk
-            _source, payload, target_type = replacement
+            _source, payload, target_type, width, height = replacement
             if target_type == 7:
                 blob = _build_dds(
-                    payload, tex.width, tex.height,
-                    _build_dds_header(tex.width, tex.height,
-                                      _infer_dxt5_mip_count(tex.width, tex.height, len(payload)) - 1, 7)
+                    payload, width, height,
+                    _build_dds_header(width, height,
+                                      _infer_dxt5_mip_count(width, height, len(payload)) - 1, 7)
                 )
             elif target_type in (5, 6):
                 blob = _build_dds(
-                    payload, tex.width, tex.height,
-                    _build_dds_header(tex.width, tex.height, 0, target_type),
+                    payload, width, height,
+                    _build_dds_header(width, height, 0, target_type),
                 )
             elif target_type == 0:
-                blob = _build_tga_header(tex.width, tex.height) + payload
+                depth = 24 if len(payload) == width * height * 3 else 32
+                blob = _build_tga_header(width, height, depth) + payload
             elif tex.texture_type == 1:
                 palette_id = struct.unpack_from("<I", self._texture_data, tex.data_offset - 4)[0]
                 palette_entry = next((e for e in self._texture_file_entries if e.key == palette_id), None)
                 if palette_entry is None:
                     raise ValueError("Texture palette not found.")
                 palette = bytes(self._texture_data[palette_entry.data_offset + 4:palette_entry.data_offset + palette_entry.size])
-                blob = _build_palette_tga(tex.width, tex.height, palette, payload)
+                blob = _build_palette_tga(width, height, palette, payload)
             else:
                 return
             image = Image.open(io.BytesIO(blob)).convert("RGBA")
@@ -279,84 +283,54 @@ class TextureEditorMixin:
         except Exception as exc:
             self.texture_replacement_preview.configure(image="", text=f"Orientation preview unavailable\n{exc}")
 
+    def _texture_dimensions_changed(self) -> None:
+        replacement = getattr(self, "_texture_replacement", None)
+        if replacement:
+            self._prepare_texture_replacement(replacement[0])
+
     def import_texture_replacement(self) -> None:
-        tex = self._texture_selected()
-        if not tex:
+        if not self._texture_selected():
             messagebox.showinfo("Texture Swap", "Select the texture to replace first.")
             return
-        filetypes = [("Images", "*.png *.jpg *.jpeg *.tga *.bmp *.dds *.webp"), ("All files", "*.*")]
-        source = filedialog.askopenfilename(title="Import replacement texture", filetypes=filetypes)
-        if not source:
+        source = filedialog.askopenfilename(
+            title="Import replacement texture",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.tga *.bmp *.dds *.webp"), ("All files", "*.*")],
+        )
+        if source:
+            self._texture_rotation = 0
+            self._texture_flip_x = False
+            # Jade scanlines are vertically opposite to conventional images.
+            self._texture_flip_y = True
+            self._prepare_texture_replacement(Path(source))
+
+    def _prepare_texture_replacement(self, source: Path) -> None:
+        tex = self._texture_selected()
+        if tex is None:
             return
         try:
-            target_type = 7 if tex.texture_type == 1 else tex.texture_type
-            if tex.texture_type == 7:
-                payload = _dds_payload_from_file(Path(source), tex, bytes(self._texture_data))
-            elif tex.texture_type == 5:
-                # Jade Toolkit keeps existing DXT1 textures as type 5. Their
-                # four-byte native prefix is retained while applying the patch.
-                payload = _dxt1_payload_from_file(Path(source), tex)
-            elif tex.texture_type == 1:
-                # Palette textures intentionally become DXT5, matching the
-                # existing Auto conversion path.
-                payload = _dxt5_payload_for_converted_texture(Path(source), tex)
-            elif tex.texture_type == 0:
-                payload = _tga_payload_from_file(Path(source), tex, bytes(self._texture_data))
-            elif tex.texture_type == 1:
-                if tex.data_offset < 4:
-                    raise ValueError("Palette texture: invalid offset.")
-                palette_id = struct.unpack_from("<I", self._texture_data, tex.data_offset - 4)[0]
-                palette_entry = next((e for e in self._texture_file_entries if e.key == palette_id), None)
-                if palette_entry is None:
-                    raise ValueError(f"Palette 0x{palette_id:08X} not found in the BIN.")
-                palette = bytes(self._texture_data[palette_entry.data_offset + 4:palette_entry.data_offset + palette_entry.size])
-                payload = _palette_payload_from_file(
-                    Path(source), tex, palette,
-                    bytes(self._texture_data[tex.data_offset:tex.data_end]),
-                )
-            else:
-                raise ValueError(f"Unsupported POP texture format: type {tex.texture_type}.")
-            self._texture_replacement = (Path(source), payload, target_type)
-            self._texture_patch_source_type = tex.texture_type
-            self._texture_patch_key = tex.key
-            # Jade scanlines are vertically opposite to conventional image files.
-            # Apply this correction by default; the user can still toggle it off.
-            self._texture_flip_y = True
-            self._update_texture_transform_label()
-            if target_type == 7:
-                preview_dds = _build_dds(payload, tex.width, tex.height,
-                                         _build_dds_header(tex.width, tex.height,
-                                                           _infer_dxt5_mip_count(tex.width, tex.height, len(payload)) - 1, 7))
-                self._set_preview_from_dds(self.texture_replacement_preview, preview_dds)
-            elif target_type in (5, 6):
-                preview_dds = _build_dds(
-                    payload, tex.width, tex.height,
-                    _build_dds_header(tex.width, tex.height, 0, target_type),
-                )
-                self._set_preview_from_dds(self.texture_replacement_preview, preview_dds)
-            else:
-                if tex.texture_type == 0:
-                    preview = _build_tga_header(tex.width, tex.height) + payload
-                else:
-                    preview = self._palette_tga_blob_for_texture(tex)
-                    # Preview the imported indices rather than the old texture.
-                    preview = _build_palette_tga(tex.width, tex.height,
-                                                 bytes(self._texture_data[palette_entry.data_offset + 4:palette_entry.data_offset + palette_entry.size]),
-                                                 payload)
-                self._set_preview_from_tga(self.texture_replacement_preview, preview)
-            self._preview_texture_transform()
-            target_label = (
-                "DXT5 (automatic conversion)" if target_type == 7 and tex.texture_type != 7
-                else ("DXT1" if target_type == 5 else tex.format)
+            payload, target_type, width, height = _texture_replacement_from_file(
+                source, tex, bytes(self._texture_data), self.keep_imported_texture_dimensions.get(),
             )
-            self.texture_info.config(text=f"Imported: {Path(source).name} • {len(payload):,} B • {tex.width}x{tex.height} {target_label}")
+            self._texture_replacement = (source, payload, target_type, width, height)
+            # Keep the original contract for other BF copies, even after
+            # applying several replacements to the same texture in this asset.
+            original_tex = _scan_pop_textures(self._texture_original)[tex.index]
+            self._texture_patch_source_type = original_tex.texture_type
+            self._texture_patch_source_dimensions = (original_tex.width, original_tex.height)
+            self._texture_patch_key = tex.key
+            self._update_texture_transform_label()
+            self._preview_texture_transform()
+            target_label = "DXT5" if target_type == 7 else ("DXT1" if target_type == 5 else tex.format)
+            self.texture_info.config(text=f"Imported: {source.name} • {len(payload):,} B • {width}x{height} {target_label}")
             self.texture_apply_btn.configure(state="normal")
-            self._log(f"OK    Texture converted: {source} -> {len(payload):,} B {target_label} {tex.width}x{tex.height}")
+            self._log(f"OK    Texture converted: {source} -> {len(payload):,} B {target_label} {width}x{height}")
         except Exception as exc:
             self._texture_replacement = None
             self.texture_apply_btn.configure(state="disabled")
-            self._log(f"ERROR Import DDS: {exc}")
-            messagebox.showerror("Import DDS", str(exc))
+            self.texture_replacement_preview.configure(image="", text="Import a replacement texture")
+            self.texture_replacement_preview.image = None
+            self._log(f"ERROR Import texture: {exc}")
+            messagebox.showerror("Import texture", str(exc))
 
     def dump_texture(self) -> None:
         """Write the selected texture in its original embedded form beside the source .BF."""
@@ -409,11 +383,9 @@ class TextureEditorMixin:
         if not replacement:
             messagebox.showinfo("Texture Swap", "Import a texture before applying changes.")
             return
-        _source, payload, target_type = replacement
-        source_type = (getattr(self, "_texture_patch_source_type", tex.texture_type)
-                       if getattr(self, "_texture_patch_key", tex.key) == tex.key
-                       else tex.texture_type)
-        if (target_type == tex.texture_type and target_type != 5
+        _source, payload, target_type, width, height = replacement
+        dimensions_changed = (width, height) != (tex.width, tex.height)
+        if (not dimensions_changed and target_type == tex.texture_type and target_type != 5
                 and len(payload) != tex.data_end - tex.data_offset):
             messagebox.showerror("Texture Swap", "The imported texture does not have the same compressed size as the original.")
             return
@@ -422,17 +394,18 @@ class TextureEditorMixin:
                 from PIL import Image
                 if target_type == 7:
                     source_blob = _build_dds(
-                        payload, tex.width, tex.height,
-                        _build_dds_header(tex.width, tex.height,
-                                          _infer_dxt5_mip_count(tex.width, tex.height, len(payload)) - 1, 7)
+                        payload, width, height,
+                        _build_dds_header(width, height,
+                                          _infer_dxt5_mip_count(width, height, len(payload)) - 1, 7)
                     )
                 elif target_type in (5, 6):
                     source_blob = _build_dds(
-                        payload, tex.width, tex.height,
-                        _build_dds_header(tex.width, tex.height, 0, target_type),
+                        payload, width, height,
+                        _build_dds_header(width, height, 0, target_type),
                     )
                 elif target_type == 0:
-                    source_blob = _build_tga_header(tex.width, tex.height) + payload
+                    depth = 24 if len(payload) == width * height * 3 else 32
+                    source_blob = _build_tga_header(width, height, depth) + payload
                 else:
                     source_blob = self._palette_tga_blob_for_texture(tex)
                     palette_id = struct.unpack_from("<I", self._texture_data, tex.data_offset - 4)[0]
@@ -440,24 +413,21 @@ class TextureEditorMixin:
                     if palette_entry is None:
                         raise ValueError("Texture palette not found.")
                     palette = bytes(self._texture_data[palette_entry.data_offset + 4:palette_entry.data_offset + palette_entry.size])
-                    source_blob = _build_palette_tga(tex.width, tex.height, palette, payload)
+                    source_blob = _build_palette_tga(width, height, palette, payload)
                 source_image = Image.open(io.BytesIO(source_blob)).convert("RGBA")
                 source_image = _transform_texture_image(
                     source_image, self._texture_rotation, self._texture_flip_x, self._texture_flip_y
                 )
                 if target_type == 7:
-                    mip_count = _infer_dxt5_mip_count(tex.width, tex.height, len(payload))
+                    mip_count = _infer_dxt5_mip_count(width, height, len(payload))
                     payload = _encode_dxt5(source_image, mip_count)
                 elif target_type == 5:
                     payload = _encode_dxt1(source_image)
                 elif target_type == 0:
-                    transformed = source_image.tobytes()
-                    # Preserve bytes after the visible level (mips/padding).
-                    payload = bytearray(payload)
-                    for i in range(0, len(transformed), 4):
-                        r, g, b, a = transformed[i:i + 4]
-                        payload[i:i + 4] = bytes((b, g, r, a))
-                    payload = bytes(payload)
+                    # Preserve any native tail when dimensions have not changed.
+                    transformed = (source_image.convert("RGB").tobytes("raw", "BGR")
+                                   if depth == 24 else source_image.tobytes("raw", "BGRA"))
+                    payload = transformed + payload[len(transformed):]
                 elif target_type == 1:
                     palette_id = struct.unpack_from("<I", self._texture_data, tex.data_offset - 4)[0]
                     palette_entry = next((e for e in self._texture_file_entries if e.key == palette_id), None)
@@ -465,15 +435,15 @@ class TextureEditorMixin:
                         raise ValueError("Texture palette not found.")
                     palette = bytes(self._texture_data[palette_entry.data_offset + 4:palette_entry.data_offset + palette_entry.size])
                     payload = _palette_payload_from_image(source_image, tex, palette, payload)
-                if (target_type == tex.texture_type and target_type != 5
+                if (not dimensions_changed and target_type == tex.texture_type and target_type != 5
                         and len(payload) != tex.data_end - tex.data_offset):
                     raise ValueError("The transform did not produce a payload with the same size as the original.")
             except Exception as exc:
                 messagebox.showerror("Texture Swap", f"Cannot apply rotation/flip: {exc}")
                 return
         patched, count = _patch_texture_key_in_asset(
-            bytes(self._texture_data), tex.key, payload, source_type, target_type,
-            tex.width, tex.height,
+            bytes(self._texture_data), tex.key, payload, tex.texture_type, target_type,
+            tex.width, tex.height, replacement_dimensions=(width, height),
         )
         if not count:
             messagebox.showerror("Texture Swap", "Selected texture not found in the current buffer.")
@@ -490,12 +460,17 @@ class TextureEditorMixin:
         self.texture_apply_btn.configure(state="disabled")
         new_tex = next((item for item in self._texture_infos
                         if item.key == tex.key and item.texture_type == target_type
-                        and item.width == tex.width and item.height == tex.height), None)
+                        and item.width == width and item.height == height), None)
+        for item in self._texture_infos:
+            self.texture_tree.item(f"tex_{item.index}", values=(
+                f"Texture #{item.index + 1} 0x{item.key:08X}",
+                f"{item.data_end - item.data_offset:,} B", item.format, f"{item.width} x {item.height}",
+            ))
         if new_tex is not None:
             self.texture_tree.selection_set(f"tex_{new_tex.index}")
             self.texture_tree.focus(f"tex_{new_tex.index}")
             self.on_texture_selected()
-        self.texture_info.config(text=f"Replacement applied • {tex.width}x{tex.height} • type {target_type} / {len(payload):,} B. Use Save/Extract/Rebuild to write the file.")
+        self.texture_info.config(text=f"Replacement applied • {width}x{height} • type {target_type} / {len(payload):,} B. Use Save/Extract/Rebuild to write the file.")
         self._log(f"PATCH TEXTURE  key=0x{tex.key:08X} • type={target_type} • payload={len(payload):,} B")
 
     def save_texture_asset(self) -> None:
@@ -531,6 +506,8 @@ class TextureEditorMixin:
                     texture.width,
                     texture.height,
                     bytes(self._texture_data),
+                    source_dimensions=(getattr(self, "_texture_patch_source_dimensions", None)
+                                       if getattr(self, "_texture_patch_key", None) == texture.key else None),
                 )
                 _repack_legacy_bigfile_changes(self.project.path, replacements, Path(target))
                 self._log(

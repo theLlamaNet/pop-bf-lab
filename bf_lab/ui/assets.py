@@ -19,6 +19,8 @@ class AssetBrowserMixin:
         ttk.Entry(top, textvariable=self.filter_var, width=40).pack(side="left", padx=6)
         self.asset_count = ttk.Label(top, text="0 assets")
         self.asset_count.pack(side="right")
+        ttk.Button(top, text="Export all assets", command=self.extract_all_assets).pack(side="right", padx=6)
+        ttk.Button(top, text="Extract selected asset", command=self.extract_selected).pack(side="right", padx=6)
 
         split = ttk.Panedwindow(self.asset_tab, orient="horizontal")
         split.pack(fill="both", expand=True, pady=(8, 0))

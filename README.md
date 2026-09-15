@@ -35,6 +35,10 @@ The Texture Swap tab includes **Dump texture**, which writes the selected textur
 
 Replacement images can be PNG, JPG/JPEG, TGA, BMP, WebP, or DDS. The toolkit automatically resizes them to the target texture dimensions and converts them to the original POP texture representation. For DDS/DXT5, the encoder is implemented in Python and reproduces the exact original block/mipmap byte count, so a source such as `349,504 B` remains `349,504 B` after conversion even when a normal DDS exporter would emit a different mipmap chain.
 
+Enable **Keep imported texture dimensions** below the Texture Editor scan count to retain the replacement image's width and height, including larger textures. With the option off (the default), imports continue to use the selected texture's dimensions. Toggling the option also updates an image already imported but not yet applied.
+
+Resized replacements update both Jade dimension fields and the resource size. They use a fresh base image level instead of retaining mipmaps or padding from the old dimensions, and matching copies of the texture in the BF receive the new dimensions when saved. The existing texture reader supports dimensions from 1 to 8192 pixels per axis. In-game compatibility of custom resolutions still depends on the game.
+
 The Pillow runtime used for image decoding is vendored in `vendor/PIL`, so this feature does not require ImageMagick or a separate Pillow installation on the target machine.
 
 ---
@@ -83,7 +87,7 @@ run_pop_bf_lab.bat
 
 The launcher resolves Python relative to itself, so it works even when the recipient has no Python
 installation or has a different Python version installed. Do not remove `runtime/python311/` from the
-shared package.
+shared package. Startup errors are shown by the launcher and saved to `pop_bf_lab.log` in the program folder.
 
 For development, `pop_bf_lab.py` can still be run with a compatible local Python 3.11 installation.
 
