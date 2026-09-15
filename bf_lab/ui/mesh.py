@@ -21,6 +21,7 @@ from ..mesh_import import (
     _load_mesh_for_swap,
     _mesh_rli_replacements,
 )
+from ..mesh_uv import _jade_uv_to_standard
 from ..mesh_parser import _scan_pop_meshes
 from ..models import (
     Asset,
@@ -56,8 +57,8 @@ class MeshEditorMixin:
         self._mesh_fit_target = tk.BooleanVar(value=False)
         ttk.Checkbutton(options, text="Fit size and center to the original mesh", variable=self._mesh_fit_target).pack(side="left")
         ttk.Label(options, text="OBJ axes (before importing):").pack(side="left", padx=(16, 4))
-        self._mesh_obj_axes = tk.StringVar(value="Auto")
-        ttk.Combobox(options, textvariable=self._mesh_obj_axes, values=("Auto", "Jade Z-up", "glTF Y-up"), state="readonly", width=13).pack(side="left")
+        self._mesh_obj_axes = tk.StringVar(value="Jade Z-up")
+        ttk.Combobox(options, textvariable=self._mesh_obj_axes, values=("Jade Z-up", "glTF Y-up"), state="readonly", width=13).pack(side="left")
         split = ttk.Panedwindow(self.mesh_tab, orient="horizontal")
         split.pack(fill="both", expand=True)
         left = ttk.Frame(split, padding=(0, 0, 8, 0))
@@ -528,7 +529,11 @@ class MeshEditorMixin:
                             uv = [mesh.uvs[i] for i in ui]
                     if tex is not None and uv is not None:
                         tw, th = tex.size
-                        src = [(u * tw, (1.0 - v) * th) for u, v in uv]
+                        # Pillow addresses images from the top-left. Convert
+                        # Jade UVs as pop3_importer does, then translate the
+                        # standard bottom-left UVs into Pillow pixel space.
+                        standard_uv = [_jade_uv_to_standard(value) for value in uv]
+                        src = [(u * tw, (1.0 - v) * th) for u, v in standard_uv]
                         minx = max(0, int(min(p[0] for p in dst)) - 1)
                         miny = max(0, int(min(p[1] for p in dst)) - 1)
                         maxx = min(width, int(max(p[0] for p in dst)) + 2)
@@ -594,7 +599,8 @@ class MeshEditorMixin:
             for x, y, z in mesh.vertices:
                 lines.append(f"v {x:.8g} {y:.8g} {z:.8g}")
             for u, v in mesh.uvs:
-                lines.append(f"vt {u:.8g} {1.0 - v:.8g}")
+                obj_u, obj_v = _jade_uv_to_standard((u, v))
+                lines.append(f"vt {obj_u:.8g} {obj_v:.8g}")
             current_face = 0
             for mat_id, count in mesh.material_ids:
                 lines.append(f"usemtl mat_{mat_id}")

@@ -10,6 +10,7 @@ import json
 import math
 import struct
 from .models import MeshInfo
+from .mesh_uv import _standard_uv_to_jade
 from .resources import _parse_pop_file_entries
 
 
@@ -376,10 +377,10 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
     return mesh, preview_images, material_textures, material_colors
 
 
-def _load_obj_mesh_for_swap(path: Path, axes: str = "Auto"):
+def _load_obj_mesh_for_swap(path: Path, axes: str = "Jade Z-up"):
     """OBJ corners retain independent position/UV/normal indices and materials."""
     text = path.read_text(encoding="utf-8-sig", errors="replace")
-    jade_axes = axes == "Jade Z-up" or (axes == "Auto" and "# Exported by PoP BF Lab" in text[:200])
+    jade_axes = axes == "Jade Z-up"
     def convert(p): return tuple(p) if jade_axes else (p[0], -p[2], p[1])
     positions, texcoords, source_normals = [], [], []
     vertices, normals, faces, uv_faces, materials = [], [], [], [], []
@@ -412,7 +413,7 @@ def _load_obj_mesh_for_swap(path: Path, axes: str = "Auto"):
                         v = [x/w for x in v]
                     positions.append(convert(v))
                 elif op == "vn": source_normals.append(convert(v))
-                else: texcoords.append((v[0], 1.0-v[1]))
+                else: texcoords.append(_standard_uv_to_jade((v[0], v[1])))
             elif op == "usemtl":
                 name = " ".join(values)
                 if name not in material_lookup: material_lookup[name] = len(material_lookup)
@@ -482,7 +483,7 @@ def _load_obj_mesh_for_swap(path: Path, axes: str = "Auto"):
     return mesh, images, textures, colors
 
 
-def _load_mesh_for_swap(path: Path, obj_axes: str = "Auto"):
+def _load_mesh_for_swap(path: Path, obj_axes: str = "Jade Z-up"):
     if path.suffix.lower() == ".obj": return _load_obj_mesh_for_swap(path, obj_axes)
     if path.suffix.lower() == ".glb": return _load_glb_mesh_for_swap(path)
     raise ValueError("Unsupported mesh format: choose .glb or .obj.")

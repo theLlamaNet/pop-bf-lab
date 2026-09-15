@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import math
 
+from .mesh_uv import _jade_uv_to_standard
+
 
 try:
     from pyopengltk import OpenGLFrame
@@ -150,7 +152,8 @@ if OpenGLFrame is not None:
                     if uv_indices and face_index < len(uv_indices) and uvs:
                         ui = uv_indices[face_index][corner]
                         if 0 <= ui < len(uvs):
-                            GL.glTexCoord2f(float(uvs[ui][0]), 1.0 - float(uvs[ui][1]))
+                            u, v = _jade_uv_to_standard(uvs[ui])
+                            GL.glTexCoord2f(float(u), float(v))
                     if normals and 0 <= vi < len(normals):
                         nx, ny, nz = normals[vi]
                         GL.glNormal3f(float(nx), float(ny), float(nz))
