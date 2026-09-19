@@ -132,8 +132,8 @@ class MaterialEditorMixin:
             return False
         return self.project.path.name.upper() in {"WW_FULL_GAME_WINDOWS.BF", "WW_DEMO_XBOX.BF"}
 
-    def scan_materials(self) -> None:
-        asset = self._selected_asset()
+    def scan_materials(self, asset: Asset | None = None) -> None:
+        asset = asset or self._selected_asset()
         if asset is None:
             messagebox.showinfo("Material Editor", "Select a .wow/.bin/.gao asset in the browser first.")
             return
@@ -243,6 +243,26 @@ class MaterialEditorMixin:
             self.status.set("Ready")
             self._log(f"ERROR Material scan: {exc}")
             messagebox.showerror("Material Editor", str(exc))
+
+    def open_material_editor(self, asset: Asset, material_key: int) -> None:
+        """Scan an asset in Material Editor and focus a requested material."""
+        self.scan_materials(asset)
+        match = next(
+            (index for index, info in enumerate(self._material_infos)
+             if info.material_key == material_key),
+            None
+        )
+        if match is None:
+            messagebox.showwarning(
+                "Material Editor",
+                f"Material 0x{material_key:08X} was not found in {asset.name}."
+            )
+            return
+        iid = f"mat_{match}"
+        self.material_tree.selection_set(iid)
+        self.material_tree.focus(iid)
+        self.material_tree.see(iid)
+        self.on_material_selected()
 
     def _start_material_texture_search(
         self, preferred_asset: Asset, texture_keys: set[int],

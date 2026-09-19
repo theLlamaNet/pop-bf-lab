@@ -82,10 +82,81 @@ class MeshEditorMixin:
 
         preview_split = ttk.Panedwindow(right, orient="vertical")
         preview_split.pack(fill="both", expand=True)
-        preview_box = ttk.LabelFrame(preview_split, text="Selected 3D mesh", padding=6)
-        replacement_box = ttk.LabelFrame(preview_split, text="Imported replacement mesh", padding=6)
-        preview_split.add(preview_box, weight=1)
-        preview_split.add(replacement_box, weight=1)
+
+        selected_row = ttk.Panedwindow(preview_split, orient="horizontal")
+        replacement_row = ttk.Panedwindow(preview_split, orient="horizontal")
+        preview_split.add(selected_row, weight=1)
+        preview_split.add(replacement_row, weight=1)
+
+        preview_box = ttk.LabelFrame(selected_row, text="Selected 3D mesh", padding=6)
+        materials_box = ttk.LabelFrame(selected_row, text="Materials of selected mesh", padding=5)
+        selected_row.add(preview_box, weight=4)
+        selected_row.add(materials_box, weight=1)
+
+        materials_box.columnconfigure(0, weight=1)
+        materials_box.rowconfigure(0, weight=1)
+        self.mesh_material_canvas = tk.Canvas(
+            materials_box, height=132, highlightthickness=0,
+            bg=self._dark["field"]
+        )
+        mesh_material_scrollbar = ttk.Scrollbar(
+            materials_box, orient="vertical", command=self.mesh_material_canvas.yview
+        )
+        self.mesh_material_canvas.grid(row=0, column=0, sticky="nsew")
+        mesh_material_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.mesh_material_canvas.configure(yscrollcommand=mesh_material_scrollbar.set)
+        self.mesh_material_rows = ttk.Frame(self.mesh_material_canvas)
+        self._mesh_material_rows_window = self.mesh_material_canvas.create_window(
+            (0, 0), window=self.mesh_material_rows, anchor="nw"
+        )
+        self.mesh_material_rows.bind(
+            "<Configure>",
+            lambda _event: self.mesh_material_canvas.configure(
+                scrollregion=self.mesh_material_canvas.bbox("all")
+            )
+        )
+        self.mesh_material_canvas.bind(
+            "<Configure>",
+            lambda event: self.mesh_material_canvas.itemconfigure(
+                self._mesh_material_rows_window, width=event.width
+            )
+        )
+        ttk.Label(self.mesh_material_rows, text="Select a mesh to list its materials.").pack(
+            anchor="w", padx=4, pady=4
+        )
+
+        replacement_box = ttk.LabelFrame(replacement_row, text="Imported replacement mesh", padding=6)
+        imported_materials_box = ttk.LabelFrame(
+            replacement_row, text="Materials of imported mesh", padding=5
+        )
+        replacement_row.add(replacement_box, weight=4)
+        replacement_row.add(imported_materials_box, weight=1)
+
+        imported_materials_box.columnconfigure(0, weight=1)
+        imported_materials_box.rowconfigure(0, weight=1)
+        self.swap_mesh_material_tree = ttk.Treeview(
+            imported_materials_box,
+            columns=("slot", "faces", "texture"),
+            show="headings",
+            height=6,
+        )
+        for column, title, width in (
+            ("slot", "Slot", 55),
+            ("faces", "Faces", 65),
+            ("texture", "Texture", 105),
+        ):
+            self.swap_mesh_material_tree.heading(column, text=title)
+            self.swap_mesh_material_tree.column(column, width=width, minwidth=45, anchor="w")
+        swap_material_scrollbar = ttk.Scrollbar(
+            imported_materials_box,
+            orient="vertical",
+            command=self.swap_mesh_material_tree.yview,
+        )
+        self.swap_mesh_material_tree.configure(yscrollcommand=swap_material_scrollbar.set)
+        self.swap_mesh_material_tree.grid(row=0, column=0, sticky="nsew")
+        swap_material_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.swap_mesh_material_tree.insert("", "end", values=("-", "-", "Import a mesh"))
+
         if OpenGLFrame is not None:
             self.mesh_canvas = MeshViewport(preview_box, self, highlightthickness=0, bd=0)
             self.mesh_canvas.pack(fill="both", expand=True)
@@ -112,7 +183,7 @@ class MeshEditorMixin:
         self.mesh_info = ttk.Label(info_box, text="Select a mesh to view it.", justify="left")
         self.mesh_info.pack(anchor="w")
 
-    def _collect_mesh_render_resources(self, preferred_asset: Asset, data: bytes, meshes: list[MeshInfo]) -> tuple[dict[int, object], dict[int, dict[int, int]], dict[int, dict[int, tuple[float, float, float, float]]], int]:
+    def _collect_mesh_render_resources(self, preferred_asset: Asset, data: bytes, meshes: list[MeshInfo]) -> tuple[dict[int, object], dict[int, dict[int, int]], dict[int, dict[int, tuple[float, float, float, float]]], dict[int, list[tuple[int, int | None]]], int]:
         """Resolve local mesh resources first, then search only unresolved keys."""
         local_inventory: dict[int, TextureInfo] = {}
         for texture in _scan_pop_textures(data):
@@ -126,10 +197,12 @@ class MeshEditorMixin:
 
         material_textures: dict[int, dict[int, int]] = {}
         material_colors: dict[int, dict[int, tuple[float, float, float, float]]] = {}
+        material_keys: dict[int, list[tuple[int, int | None]]] = {}
         wanted_keys: set[int] = set()
         for mesh in meshes:
             texture_map: dict[int, int] = {}
             color_map: dict[int, tuple[float, float, float, float]] = {}
+            mesh_material_keys: list[tuple[int, int | None]] = []
             pack: list[int] = []
             if mesh.material_pack_key is not None:
                 pack = packs.get(mesh.material_pack_key, [])
@@ -147,9 +220,12 @@ class MeshEditorMixin:
                     direct_record = records.get(material_id)
                     if direct_record is not None:
                         record = direct_record
+                        material_key = material_id
                         texture_key = direct_record.texture_key
                     else:
                         texture_key = legacy_materials.get(material_id)
+
+                mesh_material_keys.append((material_id, material_key))
 
                 if texture_key not in (None, 0, 0xFFFFFFFF):
                     texture_map[material_id] = texture_key
@@ -163,6 +239,7 @@ class MeshEditorMixin:
                     color_map[material_id] = (1.0, 1.0, 1.0, 1.0)
             material_textures[mesh.key] = texture_map
             material_colors[mesh.key] = color_map
+            material_keys[mesh.key] = mesh_material_keys
 
         images: dict[int, object] = {}
         for texture_key in wanted_keys:
@@ -187,7 +264,7 @@ class MeshEditorMixin:
                 missing.discard(texture_key)
 
         self._mesh_pending_texture_keys = missing - self._mesh_external_texture_misses
-        return images, material_textures, material_colors, len(wanted_keys - set(images))
+        return images, material_textures, material_colors, material_keys, len(wanted_keys - set(images))
 
     def _start_mesh_texture_search(self, preferred_asset: Asset, texture_keys: set[int], generation: int) -> None:
         """Resolve cross-asset texture references without blocking Tk's UI thread."""
@@ -278,13 +355,14 @@ class MeshEditorMixin:
             data = self.project.read_asset(asset)
             meshes = _scan_pop_meshes(data)
             _associate_mesh_material_packs(data, meshes)
-            images, texture_maps, color_maps, unresolved = self._collect_mesh_render_resources(asset, data, meshes)
+            images, texture_maps, color_maps, material_keys, unresolved = self._collect_mesh_render_resources(asset, data, meshes)
             self._mesh_data = bytearray(data)
             self._mesh_infos = meshes
             self._mesh_source_asset = asset
             self._mesh_textures = images
             self._mesh_material_textures_by_mesh = texture_maps
             self._mesh_material_colors_by_mesh = color_maps
+            self._mesh_material_keys_by_mesh = material_keys
             self._mesh_material_textures = texture_maps.get(meshes[0].key, {}) if meshes else {}
 
             self._clear_tree(self.mesh_tree)
@@ -329,6 +407,7 @@ class MeshEditorMixin:
             self._swap_mesh_material_colors = material_colors
             if OpenGLFrame is not None and isinstance(self.swap_mesh_canvas, MeshViewport):
                 self.swap_mesh_canvas.set_scene(mesh, textures, material_textures, material_colors)
+            self._refresh_imported_mesh_material_list(mesh, material_textures)
             self.swap_mesh_info.config(text=(
                 f"{path.name} - {len(mesh.vertices):,} vertices - {len(mesh.faces):,} faces - "
                 f"{len(material_colors)} materials - {len(textures)} textures\n"
@@ -343,6 +422,7 @@ class MeshEditorMixin:
             self._swap_mesh_textures = {}
             self._swap_mesh_material_textures = {}
             self._swap_mesh_material_colors = {}
+            self._refresh_imported_mesh_material_list(None, {})
             self.swap_mesh_info.config(text=f"Mesh import failed: {exc}")
             self._log(f"ERROR Mesh replacement import: {exc}")
             messagebox.showerror("Import replacement mesh", str(exc))
@@ -413,6 +493,7 @@ class MeshEditorMixin:
         mesh = self._selected_mesh()
         if mesh is None:
             return
+        self._refresh_mesh_material_list(mesh)
         self.mesh_info.config(text=(
             f"Mesh ID 0x{mesh.key:08X} • {len(mesh.vertices):,} vertices • {len(mesh.faces):,} faces • "
             f"version {mesh.version} / {mesh.layout_name or 'prototype layout'} / {len(mesh.skin_bones or [])} bones" + (f" • object: {mesh.object_name}" if mesh.object_name else "")
@@ -423,6 +504,74 @@ class MeshEditorMixin:
             self.mesh_canvas.set_scene(mesh, self._mesh_textures, texture_map, color_map)
         else:
             self._render_selected_mesh()
+
+    def _refresh_mesh_material_list(self, mesh: MeshInfo) -> None:
+        for child in self.mesh_material_rows.winfo_children():
+            child.destroy()
+
+        assignments = self._mesh_material_keys_by_mesh.get(mesh.key, [])
+        seen: set[tuple[int, int | None]] = set()
+        visible = []
+        for material_id, material_key in assignments:
+            identity = (material_id, material_key)
+            if identity not in seen:
+                seen.add(identity)
+                visible.append(identity)
+
+        if not visible:
+            ttk.Label(self.mesh_material_rows, text="No materials detected for this mesh.").pack(
+                anchor="w", padx=4, pady=4
+            )
+            return
+
+        for material_id, material_key in visible:
+            row = ttk.Frame(self.mesh_material_rows, padding=(4, 2))
+            row.pack(fill="x")
+            key_text = f"0x{material_key:08X}" if material_key is not None else "unresolved"
+            ttk.Label(row, text=f"Slot {material_id}: {key_text}").pack(
+                side="left", fill="x", expand=True
+            )
+            ttk.Button(
+                row, text="Open in Material editor",
+                command=lambda key=material_key: self.open_mesh_material_in_editor(key)
+            ).pack(side="right")
+
+        self.mesh_material_canvas.yview_moveto(0.0)
+
+    def _refresh_imported_mesh_material_list(
+        self, mesh: MeshInfo | None, material_textures: dict[int, int]
+    ) -> None:
+        self._clear_tree(self.swap_mesh_material_tree)
+        if mesh is None:
+            self.swap_mesh_material_tree.insert("", "end", values=("-", "-", "Import a mesh"))
+            return
+
+        face_counts: dict[int, int] = {}
+        for material_id, count in mesh.material_ids:
+            face_counts[material_id] = face_counts.get(material_id, 0) + count
+        if not face_counts:
+            self.swap_mesh_material_tree.insert("", "end", values=("-", "-", "No materials"))
+            return
+
+        for material_id, count in face_counts.items():
+            texture_key = material_textures.get(material_id)
+            texture_text = f"0x{texture_key:08X}" if texture_key is not None else "none"
+            self.swap_mesh_material_tree.insert(
+                "", "end", values=(material_id, f"{count:,}", texture_text)
+            )
+
+    def open_mesh_material_in_editor(self, material_key: int | None) -> None:
+        if material_key is None:
+            messagebox.showwarning(
+                "Material Editor",
+                "This mesh material reference could not be resolved to a material record."
+            )
+            return
+        asset = self._mesh_source_asset
+        if asset is None:
+            messagebox.showinfo("Material Editor", "Scan a mesh asset first.")
+            return
+        self.open_material_editor(asset, material_key)
 
     def _mesh_mouse_down(self, event) -> None:
         self._mesh_drag = (event.x, event.y, self._mesh_yaw, self._mesh_pitch)

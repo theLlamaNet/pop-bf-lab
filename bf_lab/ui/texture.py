@@ -299,8 +299,7 @@ class TextureEditorMixin:
         if source:
             self._texture_rotation = 0
             self._texture_flip_x = False
-            # Jade scanlines are vertically opposite to conventional images.
-            self._texture_flip_y = True
+            self._texture_flip_y = False
             self._prepare_texture_replacement(Path(source))
 
     def _prepare_texture_replacement(self, source: Path) -> None:

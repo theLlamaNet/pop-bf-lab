@@ -61,6 +61,7 @@ class JadeToolkit(AssetBrowserMixin, RepackMixin, OvaEditorMixin, MeshEditorMixi
         self._mesh_material_textures: dict[int, int] = {}
         self._mesh_material_textures_by_mesh: dict[int, dict[int, int]] = {}
         self._mesh_material_colors_by_mesh: dict[int, dict[int, tuple[float, float, float, float]]] = {}
+        self._mesh_material_keys_by_mesh: dict[int, list[tuple[int, int | None]]] = {}
         self._swap_mesh: MeshInfo | None = None
         self._swap_mesh_textures: dict[int, object] = {}
         self._swap_mesh_material_textures: dict[int, int] = {}
