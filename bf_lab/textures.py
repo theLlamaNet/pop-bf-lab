@@ -625,6 +625,8 @@ def _texture_replacement_from_file(path: Path, texture: TextureInfo, original: b
             width, height = image.size
         if not (1 <= width <= 8192 and 1 <= height <= 8192):
             raise ValueError("POP texture dimensions must be between 1 and 8192 pixels.")
+    if target_type in (5, 7) and (width % 4 or height % 4):
+        raise ValueError("Jade DXT textures require dimensions divisible by 4.")
     if (width, height) != (texture.width, texture.height):
         image = _image_rgba(path, width, height)
         # A changed surface gets a new base level; old mips/padding describe

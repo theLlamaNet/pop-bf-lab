@@ -45,7 +45,7 @@ Replacement images can be PNG, JPG/JPEG, TGA, BMP, WebP, or DDS. The toolkit aut
 
 Enable **Keep imported texture dimensions** below the Texture Editor scan count to retain the replacement image's width and height, including larger textures. With the option off (the default), imports continue to use the selected texture's dimensions. Toggling the option also updates an image already imported but not yet applied.
 
-Resized replacements update both Jade dimension fields and the resource size. They use a fresh base image level instead of retaining mipmaps or padding from the old dimensions, and matching copies of the texture in the BF receive the new dimensions when saved. The existing texture reader supports dimensions from 1 to 8192 pixels per axis. In-game compatibility of custom resolutions still depends on the game.
+Resized replacements update the cooked surface dimensions and resource size while preserving the original TEX file parameters, following Jade Toolkit. They use a fresh base image level instead of retaining mipmaps or padding from the old dimensions. Saving the BF also synchronizes header-only references and duplicate copies of the same texture key. DXT dimensions must be divisible by four. The existing texture reader supports dimensions from 1 to 8192 pixels per axis. In-game compatibility of custom resolutions still depends on the game.
 
 The Pillow runtime used for image decoding is vendored in `vendor/PIL`, so this feature does not require ImageMagick or a separate Pillow installation on the target machine.
 
@@ -160,3 +160,17 @@ This toolkit was developed using architectural reverse engineering research base
 ## License & Legal Disclaimer
 
 This project is released strictly for research, reverse engineering, and educational purposes. All product names, trademarks, and registered trademarks belong to their respective owners. *Prince of Persia* and the Jade Engine are trademarks or registered trademarks of Ubisoft.
+
+### Mesh lighting and imported materials
+
+Static mesh replacement spatially transfers original baked vertex lighting to new vertices, including per-instance GAO RLI tables and rebuilt rendering buffers. Exact matching vertices retain their original colour, and Jade alpha flags are preserved. This transfers the existing lighting; it does not recompute shadows for a radically different shape.
+
+GLB base-colour textures and OBJ `map_Kd` images are applied with the replacement mesh. Imports fill the original material slots first and extend the original pack only when needed. Existing material and texture keys are reused where possible; other objects sharing those keys also see their updated contents. Additional slots are serialized in both primary geometry and cooked buffers. Imported colour factors are baked into the images. Meshes without usable attached textures retain the existing material behavior; untextured slots in mixed imports retain an original material.
+
+New texture records carry their own resource key internally and are inserted into the native descriptor/pixel loading phases, before the stream footer. Materials precede their new texture dependencies. This corrects malformed references and loading order produced by the earlier importer. Already exported archives must be rebuilt from a clean source using the corrected importer.
+
+The Mesh Editor's compact, scrollable Import options tree contains `Fit size and center to the original mesh` and `Recalculate imported mesh collision`. Collision recalculation builds a triangle collider from the final imported geometry, welds seam vertices, rebuilds normals and adjacency, and attaches a private ColMap to each direct static GAO instance. Its bounds include the instance transform. Existing per-object ColMaps are replaced; separate room collision is not removed. Skinned character collision and indirect LOD instances are unsupported and produce an explicit error instead of saving a partial replacement. Both options are off by default.
+
+Save BF/BIN/DEC persists the added resources. Native material and texture templates must be present in the selected asset. Shared multi-LOD material replacement is rejected because changing one LOD's slot layout could break the others. Full PBR shaders and normal/metallic/roughness maps are not converted.
+
+Validation: `runtime/python311/python.exe -B -m unittest discover -s tests -v`. Structural checks also covered nine static meshes and three skinned meshes from SOT, WW and T2T, including added slots and retained bones. Visual validation in the games remains pending.

@@ -407,58 +407,55 @@ def _patch_texture_key_in_asset(asset_data: bytes, texture_key: int, replacement
                                 width: int, height: int,
                                 replacement_dimensions: tuple[int, int] | None = None) -> tuple[bytes, int]:
     """Patch matching POP texture entries, rebuilding their header if needed."""
+    from .resources import _parse_pop_file_entries
+    from .textures import _infer_mip_count
     data = bytearray(asset_data)
     target_width, target_height = replacement_dimensions or (width, height)
     if not (1 <= target_width <= 8192 and 1 <= target_height <= 8192):
         raise ValueError("POP texture dimensions must be between 1 and 8192 pixels.")
-    matches = 0
+    if target_type in (5, 6, 7) and (target_width % 4 or target_height % 4):
+        raise ValueError("Jade DXT textures require dimensions divisible by 4.")
     try:
-        textures = _scan_pop_textures(data)
+        entries = _parse_pop_file_entries(data)
     except (ValueError, struct.error):
-        # A BF also contains non-POP resources. They cannot hold a POP
-        # texture record, so skip them while looking for duplicate texture keys.
         return asset_data, 0
-    # Work backwards: a texture replacement can change its FileEntry size.
-    for tex in reversed(textures):
-        if tex.key != texture_key:
+    matches = 0
+    for resource in reversed(entries):
+        if resource.key != texture_key or resource.size < 56:
             continue
-        # The selected asset is already converted when saving a BF. Count it
-        # without touching it, so it remains in the replacement set.
-        if (tex.texture_type == target_type
-                and (tex.width, tex.height) == (target_width, target_height)
-                and bytes(data[tex.data_offset:tex.data_end]) == replacement_payload):
-            matches += 1
+        raw = bytes(data[resource.data_offset:resource.data_offset + resource.size])
+        if (struct.unpack_from("<I", raw, 4)[0] != 0xFFFFFFFF
+                or struct.unpack_from("<I", raw, 24)[0] != 0xCAD01234
+                or struct.unpack_from("<I", raw, 32)[0] != 0xC0DEC0DE):
             continue
-        if tex.texture_type != source_type:
+        old_type = struct.unpack_from("<I", raw, 40)[0]
+        if old_type not in (source_type, target_type):
             continue
-        if (tex.width, tex.height) != (width, height):
-            continue
-        # tex.offset is the FileEntry data start. The Jade texture header is
-        # 56 B long here; types 1 and 5 have an additional four-byte prefix.
-        header_end = tex.offset + 56
-        if header_end > tex.data_end:
-            continue
-        entry = bytearray(data[tex.offset:header_end])
-        if (target_width, target_height) != (tex.width, tex.height):
-            struct.pack_into("<hh", entry, 12, target_width, target_height)
-            struct.pack_into("<II", entry, 44, target_width, target_height)
-        struct.pack_into("<I", entry, 40, target_type)
-        # Match Jade Toolkit: replacements in DXT/BGRA formats carry just the
-        # base level and reset Jade's mip-count field.
-        if target_type in (0, 5, 6, 7):
-            struct.pack_into("<I", entry, 52, 0)
-        if target_type in (1, 5):
-            # A DXT1 replacement must retain the native prefix (unlike a
-            # PAL8 -> DXT5 conversion, which intentionally removes it).
-            prefix = (bytes(data[header_end:tex.data_offset])
-                      if tex.texture_type == target_type else b"\x00\x00\x00\x00")
-            if len(prefix) != 4:
-                continue
+        old_w, old_h = struct.unpack_from("<II", raw, 44)
+        pixel_start = 60 if old_type in (1, 5) else 56
+        if old_type == 11 and struct.unpack_from("<I", raw, 36)[0] >= 4:
+            pixel_start = 64
+        blocks = max(1, (old_w + 3)//4) * max(1, (old_h + 3)//4)
+        base_size = {0: old_w*old_h*3, 1: old_w*old_h,
+                     5: blocks*8, 6: blocks*16, 7: blocks*16,
+                     11: (old_w*old_h+1)//2}.get(old_type, 0)
+        stub = len(raw) - pixel_start < base_size
+        header = bytearray(raw[:56])
+        # The first dimensions belong to TEX_tdst_File_Params. Preserve them
+        # as TextureUpscale.cpp does; the cooked surface has its own dimensions.
+        struct.pack_into("<III", header, 40, target_type, target_width, target_height)
+        mip_count = 0
+        if target_type in (5, 6, 7):
+            mip_count = _infer_mip_count(target_width, target_height, len(replacement_payload),
+                                         8 if target_type == 5 else 16) - 1
+        struct.pack_into("<I", header, 52, mip_count)
+        if stub:
+            replacement_entry = bytes(header) + bytes(max(0, len(raw)-56))
         else:
-            prefix = b""
-        replacement_entry = bytes(entry) + prefix + replacement_payload
-        struct.pack_into("<I", data, tex.offset - 12, len(replacement_entry))
-        data[tex.offset:tex.data_end] = replacement_entry
+            prefix = bytes(4) if target_type in (1, 5) else b""
+            replacement_entry = bytes(header) + prefix + replacement_payload
+        struct.pack_into("<I", data, resource.offset, len(replacement_entry))
+        data[resource.data_offset:resource.data_offset + resource.size] = replacement_entry
         matches += 1
     return bytes(data), matches
 

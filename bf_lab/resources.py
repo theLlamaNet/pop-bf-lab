@@ -93,3 +93,11 @@ def _parse_pop_file_entries(data: bytes) -> list[PopFileEntry]:
     if pos != len(data):
         raise ValueError(f"Misaligned FileEntry table: parsing stopped at 0x{pos:X} of 0x{len(data):X}.")
     return entries
+
+
+def _split_pop_footer(data: bytes) -> tuple[bytes, bytes]:
+    """Dependencies precede the runtime end marker (ObjectPlacer.cpp)."""
+    entries = _parse_pop_file_entries(data)
+    if entries and entries[-1].key == 0x0FF7C0DE:
+        return data[:entries[-1].offset], data[entries[-1].offset:]
+    return data, b""

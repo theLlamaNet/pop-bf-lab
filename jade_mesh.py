@@ -271,7 +271,29 @@ def triangulate_polygon(points):
     return result
 
 
-def build_replacement(raw, target, mesh):
+def transfer_colors(old_vertices, new_vertices, colors):
+    """Resample baked lighting; alpha is a Jade flag, not an interpolant."""
+    if not colors:
+        raise ValueError('Cannot transfer an empty lighting table.')
+    tree = NearestPoints(old_vertices, range(len(colors)))
+    result, cache = [], {}
+    for vertex in new_vertices:
+        point = tuple(vertex)
+        if point not in cache:
+            near = tree.nearest(point)
+            if near[0][0] < 1e-18:
+                value = colors[near[0][1]]
+            else:
+                weights = [(1.0 / max(d, 1e-18), i) for d, i in near]
+                total = sum(w for w, _ in weights)
+                value = bytes(round(sum(w * colors[i][c] for w, i in weights) / total)
+                              for c in range(3)) + colors[near[0][1]][3:4]
+            cache[point] = value
+        result.append(cache[point])
+    return result
+
+
+def build_replacement(raw, target, mesh, imported_materials=False):
     layout = read_layout(raw)
     kind, version, flags, flags2, nv, nc, colors, nu, ne, marker = layout.header
     if (nv,nu,ne) != (len(target.vertices),len(target.uvs),len(target.material_ids)):
@@ -291,6 +313,9 @@ def build_replacement(raw, target, mesh):
     counts = [c for _,c in mesh.material_ids]
     if len(counts)>ne: counts=counts[:ne-1]+[sum(counts[ne-1:])]
     elements=[(mat, counts[i] if i<len(counts) else 0) for i,(mat,_) in enumerate(target.material_ids)]
+    if imported_materials:
+        elements = list(mesh.material_ids)
+        ne = len(elements)
     normals = mesh.normals
     if normals is None or len(normals)!=len(mesh.vertices):
         raise ValueError('One normal per vertex is required before serialization.')
@@ -307,9 +332,9 @@ def build_replacement(raw, target, mesh):
     result.extend(struct.pack('<I',1))
     for v in mesh.vertices+normals: result.extend(struct.pack('<3f',*v))
     if colors:
-        cmap={tuple(round(x,5) for x in target.vertices[i]): raw[layout.color_offset+i*4:layout.color_offset+i*4+4]
-              for i in range(min(nv,nc))}
-        for v in mesh.vertices: result.extend(cmap.get(tuple(round(x,5) for x in v),b'\xff'*4))
+        original_colors = [raw[layout.color_offset+i*4:layout.color_offset+i*4+4] for i in range(min(nv,nc))]
+        result.extend(b''.join(transfer_colors(target.vertices, mesh.vertices, original_colors))
+                      if original_colors else b'\xff' * (len(mesh.vertices)*4))
     for uv in mesh.uvs: result.extend(struct.pack('<2f',*uv))
     for mat,count in elements: result.extend(struct.pack('<Ii',count,mat))
     expanded,lookup,indices=[],{},[]

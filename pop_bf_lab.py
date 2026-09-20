@@ -169,4 +169,5 @@ from bf_lab.viewports import (
 
 if __name__ == "__main__":
     app = JadeToolkit()
+    app.iconbitmap("bigfile.ico")
     app.mainloop()

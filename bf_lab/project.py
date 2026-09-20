@@ -29,6 +29,8 @@ class JadeProject:
         self.direct_compressed = False
         self.modified = False
         self.mesh_patches: dict[int, dict[int, tuple[int, bytes, bytes]]] = {}
+        self.resource_additions: dict[int, dict[int, tuple[int, int, bytes]]] = {}
+        self.collision_additions: dict[int, list[tuple[int, int, bytes, int]]] = {}
 
     @property
     def title(self) -> str:
@@ -37,6 +39,8 @@ class JadeProject:
     def open_bf(self, path: Path) -> None:
         info = read_bigfile(path)
         self.mesh_patches.clear()
+        self.resource_additions.clear()
+        self.collision_additions.clear()
         self.path = path
         self.kind = "bf"
         self.info = info
@@ -58,6 +62,8 @@ class JadeProject:
             decoded = decompress_pop_lzo(raw)
             compressed = True
         self.mesh_patches.clear()
+        self.resource_additions.clear()
+        self.collision_additions.clear()
         self.path = path
         self.kind = "bin"
         self.info = None
@@ -70,6 +76,8 @@ class JadeProject:
     def open_dec(self, path: Path) -> None:
         data = path.read_bytes()
         self.mesh_patches.clear()
+        self.resource_additions.clear()
+        self.collision_additions.clear()
         self.path = path
         self.kind = "dec"
         self.info = None
@@ -89,19 +97,24 @@ class JadeProject:
 
     def apply_mesh_patches(self, asset_index: int, data: bytes) -> bytes:
         patches = self.mesh_patches.get(asset_index, {})
-        if not patches:
+        additions = self.resource_additions.get(asset_index, {})
+        collisions = self.collision_additions.get(asset_index, [])
+        if not patches and not additions and not collisions:
             return data
-        entries = _parse_pop_file_entries(data)
-        for index, (key, original, replacement) in sorted(patches.items(), reverse=True):
-            if index >= len(entries) or entries[index].key != key:
-                raise ValueError("The asset structure has changed: cannot apply meshes.")
-            entry = entries[index]
-            current = data[entry.data_offset:entry.data_offset + entry.size]
-            if current not in (original, replacement):
-                raise ValueError(f"Conflicting editor changes on mesh 0x{key:08X}; rescan the asset.")
-            data = (data[:entry.offset] + struct.pack("<III", len(replacement), entry.magic, key)
-                    + replacement + data[entry.data_offset + entry.size:])
-        _parse_pop_file_entries(data)
+        from .material_stream import insert_material_resources, validate_material_resources
+        from .mesh_collision import insert_collision_resources
+        data = insert_collision_resources(data, collisions)
+        data = insert_material_resources(data, list(additions.values()))
+        for index, (key, original, replacement) in patches.items():
+            entries = _parse_pop_file_entries(data)
+            candidates = [entry for entry in entries if entry.key == key and
+                          data[entry.data_offset:entry.data_offset+entry.size] in (original, replacement)]
+            if not candidates:
+                raise ValueError(f"Conflicting editor changes on resource 0x{key:08X}; rescan the asset.")
+            for entry in reversed(candidates):
+                data = (data[:entry.offset] + struct.pack("<III", len(replacement), entry.magic, key)
+                        + replacement + data[entry.data_offset+entry.size:])
+        validate_material_resources(data, {key for key, _, _ in additions.values()})
         return data
 
     def save_bin_as(self, target: Path, data: bytes) -> None:

@@ -352,7 +352,7 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
                 uv_indices.append(tuple(uv_start + index for index in triangle))
             material_id = int(primitive.get("material", primitive_index))
             material_ids.append((material_id, len(triangles)))
-            material = materials[material_id] if isinstance(materials, list) and 0 <= material_id < len(materials) else {}
+            material = materials[material_id] if "material" in primitive and isinstance(materials, list) and 0 <= material_id < len(materials) else {}
             pbr = material.get("pbrMetallicRoughness", {}) if isinstance(material, dict) else {}
             factor = pbr.get("baseColorFactor", [1.0, 1.0, 1.0, 1.0]) if isinstance(pbr, dict) else [1.0, 1.0, 1.0, 1.0]
             factor = (factor if isinstance(factor, list) else [1.0] * 4) + [1.0] * 4
@@ -562,9 +562,8 @@ def _mesh_rli_replacements(data: bytes, target: MeshInfo, mesh: MeshInfo) -> dic
         end = start + len(target.vertices) * 4
         if end + 4 > len(payload) or struct.unpack_from("<I", payload, end)[0] != 1:
             raise ValueError("Unrecognized primary RLI table.")
-        colors = {tuple(round(x, 5) for x in v): payload[start+i*4:start+i*4+3] + b"\xfe"
-                  for i, v in enumerate(target.vertices)}
-        new_colors = [colors.get(tuple(round(x, 5) for x in v), b"\xff\xff\xff\xfe") for v in mesh.vertices]
+        colors = [payload[start+i*4:start+i*4+4] for i in range(len(target.vertices))]
+        new_colors = jade_mesh.transfer_colors(target.vertices, mesh.vertices, colors)
         tail = payload[end:]
         for offset in range(0, min(80, len(tail)-15), 4):
             tag, size, count, stride = struct.unpack_from("<4I", tail, offset)
@@ -582,11 +581,11 @@ def _mesh_rli_replacements(data: bytes, target: MeshInfo, mesh: MeshInfo) -> dic
     return updates
 
 
-def _build_static_mesh_replacement(data: bytes, target: MeshInfo, mesh: MeshInfo) -> bytes:
+def _build_static_mesh_replacement(data: bytes, target: MeshInfo, mesh: MeshInfo, imported_materials=False) -> bytes:
     """Compatibility entry point; now handles static and skinned retail GEO."""
     entry = _parse_pop_file_entries(data)[target.entry_index]
     if entry.key != target.key:
         raise ValueError("Source mesh has changed: rescan the asset.")
     raw = data[entry.data_offset:entry.data_offset + entry.size]
     candidate = replace(mesh, normals=mesh.normals or _mesh_vertex_normals(mesh.vertices, mesh.faces))
-    return jade_mesh.build_replacement(raw, target, candidate)
+    return jade_mesh.build_replacement(raw, target, candidate, imported_materials)

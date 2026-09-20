@@ -22,6 +22,9 @@ from ..mesh_import import (
     _mesh_rli_replacements,
 )
 from ..mesh_uv import _jade_uv_to_standard
+from ..mesh_material_import import import_mesh_materials
+from ..material_stream import insert_material_resources, validate_material_resources
+from ..mesh_collision import recalculate_mesh_collision, insert_collision_resources
 from ..mesh_export import _mesh_obj_lines
 from ..mesh_parser import _scan_pop_meshes
 from ..models import (
@@ -56,7 +59,24 @@ class MeshEditorMixin:
         options = ttk.Frame(self.mesh_tab)
         options.pack(fill="x", pady=(0, 6))
         self._mesh_fit_target = tk.BooleanVar(value=False)
-        ttk.Checkbutton(options, text="Fit size and center to the original mesh", variable=self._mesh_fit_target).pack(side="left")
+        self._mesh_recalculate_collision = tk.BooleanVar(value=False)
+        option_box = ttk.LabelFrame(options, text="Import options", padding=3)
+        option_box.pack(side="left")
+        self.mesh_options_tree = ttk.Treeview(option_box, show="tree", height=2, selectmode="browse")
+        self.mesh_options_tree.column("#0", width=370, stretch=False)
+        self.mesh_options_tree.pack(side="left", fill="both")
+        option_scroll = ttk.Scrollbar(option_box, orient="vertical", command=self.mesh_options_tree.yview)
+        option_scroll.pack(side="right", fill="y")
+        self.mesh_options_tree.configure(yscrollcommand=option_scroll.set)
+        self._mesh_option_rows = {
+            "fit": (self._mesh_fit_target, "Fit size and center to the original mesh"),
+            "collision": (self._mesh_recalculate_collision, "Recalculate imported mesh collision"),
+        }
+        for iid, (variable, label) in self._mesh_option_rows.items():
+            self.mesh_options_tree.insert("", "end", iid=iid, text="\u2610 " + label)
+        self.mesh_options_tree.bind("<Button-1>", self._toggle_mesh_option)
+        self.mesh_options_tree.bind("<space>", self._toggle_mesh_option)
+        self.mesh_options_tree.bind("<Return>", self._toggle_mesh_option)
         ttk.Label(options, text="OBJ axes (before importing):").pack(side="left", padx=(16, 4))
         self._mesh_obj_axes = tk.StringVar(value="Jade Z-up")
         ttk.Combobox(options, textvariable=self._mesh_obj_axes, values=("Jade Z-up", "glTF Y-up"), state="readonly", width=13).pack(side="left")
@@ -182,6 +202,18 @@ class MeshEditorMixin:
         info_box.pack(fill="x", pady=(8, 0))
         self.mesh_info = ttk.Label(info_box, text="Select a mesh to view it.", justify="left")
         self.mesh_info.pack(anchor="w")
+
+    def _toggle_mesh_option(self, event):
+        iid = (self.mesh_options_tree.identify_row(event.y) if event.keysym not in ("space", "Return")
+               else self.mesh_options_tree.focus())
+        if iid not in self._mesh_option_rows:
+            return
+        variable, label = self._mesh_option_rows[iid]
+        variable.set(not variable.get())
+        self.mesh_options_tree.item(iid, text=("\u2611 " if variable.get() else "\u2610 ") + label)
+        self.mesh_options_tree.focus(iid)
+        self.mesh_options_tree.selection_set(iid)
+        return "break"
 
     def _collect_mesh_render_resources(self, preferred_asset: Asset, data: bytes, meshes: list[MeshInfo]) -> tuple[dict[int, object], dict[int, dict[int, int]], dict[int, dict[int, tuple[float, float, float, float]]], dict[int, list[tuple[int, int | None]]], int]:
         """Resolve local mesh resources first, then search only unresolved keys."""
@@ -412,8 +444,8 @@ class MeshEditorMixin:
                 f"{path.name} - {len(mesh.vertices):,} vertices - {len(mesh.faces):,} faces - "
                 f"{len(material_colors)} materials - {len(textures)} textures\n"
                 f"{mesh.layout_name}; {len(mesh.source_joint_names)} source joints. "
-                "Imported materials/textures are previewed only; Apply retains those from the BF. "
-                "BF character: original rig with weights recalculated by proximity. Static target: geometry only. Export in the rest pose."
+                "Apply replaces original material slots first and adds excess slots. Meshes without textures retain BF materials. "
+                "BF character: original rig with weights recalculated by proximity. Static meshes transfer baked lighting. Export in the rest pose."
             ))
             self._log(f"OK    Mesh replacement import: {path.name} -> {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
         except Exception as exc:
@@ -443,28 +475,54 @@ class MeshEditorMixin:
             if entry.key != target.key:
                 raise ValueError("The selection no longer matches the asset: rescan it.")
             candidate = jade_mesh.fitted_mesh(self._swap_mesh, target) if self._mesh_fit_target.get() else self._swap_mesh
-            replacement = _build_static_mesh_replacement(data, target, candidate)
             updates = _mesh_rli_replacements(data, target, candidate)
+            original_candidate = candidate
+            candidate, updates, additions = import_mesh_materials(
+                data, target, candidate, self._swap_mesh_textures,
+                self._swap_mesh_material_textures, self._swap_mesh_material_colors, updates)
+            replacement = _build_static_mesh_replacement(data, target, candidate, candidate is not original_candidate)
             updates[entry.index] = replacement
+            collision_additions = []
+            if self._mesh_recalculate_collision.get():
+                updates, collision_additions = recalculate_mesh_collision(data, target, candidate, updates)
             patched = data
             for index, payload in sorted(updates.items(), reverse=True):
                 resource = entries[index]
                 patched = (patched[:resource.offset] + struct.pack("<III", len(payload), resource.magic, resource.key)
                            + payload + patched[resource.data_offset + resource.size:])
+            addition_start = max(self.project.resource_additions.get(asset.index, {}), default=-1)+1
+            patched = insert_material_resources(patched, [(key, entries[0].magic, payload) for key, payload in additions])
+            validate_material_resources(patched, {key for key, _ in additions})
+            patched = insert_collision_resources(patched, collision_additions)
             meshes = _scan_pop_meshes(patched)
-            updated = next((m for m in meshes if m.entry_index == target.entry_index), None)
+            updated = next((m for m in meshes if m.key == target.key), None)
             if updated is None or len(updated.faces) != len(self._swap_mesh.faces):
                 raise ValueError("Rebuilt mesh verification failed.")
             _associate_mesh_material_packs(patched, meshes)
+            images, texture_maps, color_maps, material_keys, _ = self._collect_mesh_render_resources(asset, patched, meshes)
             patches = self.project.mesh_patches.setdefault(asset.index, {})
             for index, payload in updates.items():
                 resource = entries[index]
-                baseline = (patches[index][1] if index in patches else
-                            data[resource.data_offset:resource.data_offset + resource.size])
-                patches[index] = (resource.key, baseline, payload)
+                previous = next((i for i, patch in patches.items() if patch[0] == resource.key and
+                                 patch[1] == data[resource.data_offset:resource.data_offset+resource.size]), None)
+                if previous is None:
+                    previous = next((i for i, patch in patches.items() if patch[0] == resource.key and
+                                     patch[2] == data[resource.data_offset:resource.data_offset+resource.size]), None)
+                patch_index = previous if previous is not None else max(patches, default=-1)+1
+                baseline = (patches[previous][1] if previous is not None else
+                            data[resource.data_offset:resource.data_offset+resource.size])
+                patches[patch_index] = (resource.key, baseline, payload)
+            staged = self.project.resource_additions.setdefault(asset.index, {})
+            for index, (key, payload) in enumerate(additions, addition_start):
+                staged[index] = (key, entries[0].magic, payload)
+            self.project.collision_additions.setdefault(asset.index, []).extend(collision_additions)
             self.project.modified = True
             self._mesh_data = bytearray(patched)
             self._mesh_infos = meshes
+            self._mesh_textures = images
+            self._mesh_material_textures_by_mesh = texture_maps
+            self._mesh_material_colors_by_mesh = color_maps
+            self._mesh_material_keys_by_mesh = material_keys
             for i, mesh in enumerate(meshes):
                 self.mesh_tree.item(f"mesh_{i}", values=(mesh.object_name or f"Mesh #{i + 1}",
                     f"{len(mesh.vertices):,}", f"{len(mesh.faces):,}", f"0x{mesh.key:08X}", mesh.layout_name or "Prototype"))
