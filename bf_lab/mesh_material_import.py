@@ -12,9 +12,10 @@ def import_mesh_materials(data, target, mesh, images, texture_map, colors, updat
     """Replace native mesh material slots without extending Jade material packs.
 
     Jade's resource loader is sensitive to material-pack growth and to extra
-    geometry elements. Therefore only existing GRM slots and geometry elements
-    are used. Imported groups beyond that capacity are folded into the final
-    native element and do not create material resources or pack entries.
+    geometry elements. Therefore only existing GRM slots are used. Keep every
+    OBJ run here: the geometry pass later regroups its faces into the fixed
+    native element list, and prematurely folding runs would attach a texture
+    to the wrong faces after Blender reorders loose objects.
     """
     if len(mesh.material_ids) > 4096:
         raise ValueError("Jade supports at most 4096 geometry elements.")
@@ -34,9 +35,7 @@ def import_mesh_materials(data, target, mesh, images, texture_map, colors, updat
     element_count = len(target.material_ids)
     if not element_count:
         raise ValueError("Cannot replace materials: the selected mesh has no material elements.")
-    groups = list(mesh.material_ids[:element_count])
-    if len(mesh.material_ids) > element_count:
-        groups[-1] = (groups[-1][0], groups[-1][1] + sum(count for _, count in mesh.material_ids[element_count:]))
+    groups = list(mesh.material_ids)
 
     native_slots = []
     for slot, _ in target.material_ids:
@@ -89,9 +88,28 @@ def import_mesh_materials(data, target, mesh, images, texture_map, colors, updat
         texture_is_opaque[cache_key] = image.getextrema()[3][0] == 255
         return texture_cache[cache_key], texture_is_opaque[cache_key]
 
+    # Stable names (mat_N) map directly.  For arbitrary material names, assign
+    # each distinct source material once rather than using the run position;
+    # the same material can occur in several non-contiguous OBJ groups.
+    stable_native_slots = "OBJ" in mesh.layout_name
+    direct_slots = ({source_slot for source_slot, _ in groups
+                     if source_slot in usable_slots}
+                    if stable_native_slots else set())
+    fallback_slots = [slot for slot in usable_slots if slot not in direct_slots]
+    fallback_slots.extend(slot for slot in usable_slots if slot in direct_slots)
+    fallback_by_source = {}
     updates, result_groups = dict(updates), []
     for position, (source_slot, count) in enumerate(groups):
-        native_slot = usable_slots[min(position, len(usable_slots) - 1)]
+        # PoP BF Lab OBJ exports name materials mat_N.  Blender can reorder
+        # objects/groups after Separate by Loose Parts, so retain that native
+        # slot identity instead of assigning textures by encounter order.
+        if stable_native_slots and source_slot in usable_slots:
+            native_slot = source_slot
+        else:
+            if source_slot not in fallback_by_source:
+                fallback_by_source[source_slot] = fallback_slots[
+                    min(len(fallback_by_source), len(fallback_slots) - 1)]
+            native_slot = fallback_by_source[source_slot]
         native_key = original[native_slot]
         image_key = texture_map.get(source_slot)
         result_groups.append((native_slot, count))

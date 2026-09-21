@@ -271,31 +271,61 @@ def triangulate_polygon(points):
     return result
 
 
-def transfer_colors(old_vertices, new_vertices, colors):
-    """Resample baked lighting; alpha is a Jade flag, not an interpolant."""
+def transfer_colors(old_vertices, new_vertices, colors, alpha=None):
+    """Transfer only baked-light luminance, never its colour cast.
+
+    Jade stores its internal 0xAABBGGRR colours as R,G,B,A bytes.  The Direct3D
+    backend swaps red/blue only when filling D3DFVF_DIFFUSE.  Depending on the
+    material, diffuse is multiplied with the texture, so white is not a safe
+    neutral fallback and can become overbright.  Conversely, spatially
+    transferring RGB propagates a room's blue/orange light cast over an edited
+    mesh.  Preserve the useful scalar lighting instead: convert original RGB
+    to Jade's 0.30/0.59/0.11 luminance and spatially interpolate that one value.
+    The result is achromatic and therefore cannot tint the texture, while
+    retaining the source mesh's local light/shadow level.
+
+    ``alpha`` forces Jade's RLI sentinel when supplied; GEO point colours keep
+    the closest original alpha.
+    """
     if not colors:
         raise ValueError('Cannot transfer an empty lighting table.')
+    if alpha is not None and not 0 <= alpha <= 255:
+        raise ValueError('The forced vertex-colour alpha must be a byte.')
+    count = min(len(old_vertices), len(colors))
+    if not count:
+        raise ValueError('Lighting table has no corresponding source vertices.')
+
+    def luminance(color):
+        # Jade internal 0xAABBGGRR is stored as R,G,B,A on little endian.
+        return round(0.30 * color[0] + 0.59 * color[1] + 0.11 * color[2])
+
+    levels = [luminance(color) for color in colors[:count]]
     # OBJ round-tripping truncates coordinates, so byte-identical comparisons
-    # miss vertices that are still the same Jade point.  MeshSwap uses a
-    # three-decimal position key and first-wins semantics for duplicated seam
-    # vertices; preserve that before interpolating genuinely new topology.
+    # miss vertices that are still the same Jade point.  Use a three-decimal
+    # key and first-wins semantics for duplicated seam vertices.
     quantized = {}
-    for vertex, color in zip(old_vertices, colors):
-        quantized.setdefault(tuple(round(value, 3) for value in vertex), color)
-    tree = NearestPoints(old_vertices, range(len(colors)))
+    for index in range(count):
+        key = tuple(round(value, 3) for value in old_vertices[index])
+        quantized.setdefault(key, index)
+    tree = NearestPoints(old_vertices, range(count))
     result, cache = [], {}
     for vertex in new_vertices:
         point = tuple(vertex)
         if point not in cache:
             key = tuple(round(value, 3) for value in point)
-            if key in quantized:
-                value = quantized[key]
+            source = quantized.get(key)
+            if source is not None:
+                level = levels[source]
+                nearest = source
             else:
                 near = tree.nearest(point)
-                weights = [(1.0 / max(d, 1e-18), i) for d, i in near]
-                total = sum(w for w, _ in weights)
-                value = bytes(round(sum(w * colors[i][c] for w, i in weights) / total)
-                              for c in range(3)) + colors[near[0][1]][3:4]
+                weights = [(1.0 / max(distance, 1e-18), index)
+                           for distance, index in near]
+                total = sum(weight for weight, _ in weights)
+                level = round(sum(weight * levels[index] for weight, index in weights) / total)
+                nearest = near[0][1]
+            value = bytes((level, level, level,
+                           alpha if alpha is not None else colors[nearest][3]))
             cache[point] = value
         result.append(cache[point])
     return result
@@ -316,11 +346,20 @@ def build_replacement(raw, target, mesh, imported_materials=False):
     for faces,count in ((mesh.faces,len(mesh.vertices)),(mesh.uv_indices,len(mesh.uvs))):
         if any(len(f)!=3 or any(not isinstance(i,int) or not 0<=i<count for i in f) for f in faces):
             raise ValueError('Triangle indices are out of range.')
-    if not target.material_ids or not mesh.material_ids or any(c<=0 for _,c in mesh.material_ids) or sum(c for _,c in mesh.material_ids)!=len(mesh.faces):
+    if (not target.material_ids or not mesh.material_ids
+            or any(c < 0 for _, c in mesh.material_ids)
+            or not any(c > 0 for _, c in mesh.material_ids)
+            or sum(c for _, c in mesh.material_ids) != len(mesh.faces)):
         raise ValueError('Invalid material slots/primitive counts.')
-    counts = [c for _,c in mesh.material_ids]
-    if len(counts)>ne: counts=counts[:ne-1]+[sum(counts[ne-1:])]
-    elements=[(mat, counts[i] if i<len(counts) else 0) for i,(mat,_) in enumerate(target.material_ids)]
+    if (len(mesh.material_ids) == ne
+            and [material for material, _ in mesh.material_ids]
+                == [material for material, _ in target.material_ids]):
+        elements = list(mesh.material_ids)
+    else:
+        counts = [c for _, c in mesh.material_ids]
+        if len(counts) > ne: counts = counts[:ne-1] + [sum(counts[ne-1:])]
+        elements = [(mat, counts[i] if i < len(counts) else 0)
+                    for i, (mat, _) in enumerate(target.material_ids)]
     if imported_materials:
         elements = list(mesh.material_ids)
         ne = len(elements)

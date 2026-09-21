@@ -8,6 +8,7 @@ import io
 import jade_mesh
 import json
 import math
+import re
 import struct
 from .models import MeshInfo
 from .mesh_uv import _standard_uv_to_jade
@@ -377,6 +378,70 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
     return mesh, preview_images, material_textures, material_colors
 
 
+_NATIVE_OBJ_MATERIAL = re.compile(r"^mat_(-?\d+)(?:\.\d{3})?$", re.IGNORECASE)
+
+
+def _obj_material_id(name: str, material_lookup: dict[str, int]) -> int:
+    """Keep PoP BF Lab's mat_N identity across Blender object reordering."""
+    if name in material_lookup:
+        return material_lookup[name]
+    match = _NATIVE_OBJ_MATERIAL.fullmatch(name.strip())
+    if match:
+        value = int(match.group(1))
+        if -0x80000000 <= value <= 0x3FFFFFFF:
+            material_lookup[name] = value
+            return value
+    # Keep arbitrary authoring-tool names away from ordinary native slot IDs.
+    value = 0x40000000 + sum(identifier >= 0x40000000
+                             for identifier in material_lookup.values())
+    material_lookup[name] = value
+    return value
+
+
+def _align_mesh_materials_to_target(
+        mesh: MeshInfo, target: MeshInfo, prefer_native_slots: bool | None = None
+        ) -> MeshInfo:
+    """Map face materials to native GEO elements, independent of OBJ order."""
+    if not target.material_ids or not mesh.material_ids:
+        return mesh
+    face_materials = []
+    cursor = 0
+    for material, count in mesh.material_ids:
+        if count < 0 or cursor + count > len(mesh.faces):
+            raise ValueError("Imported material ranges do not match the mesh faces.")
+        face_materials.extend([material] * count)
+        cursor += count
+    if cursor != len(mesh.faces):
+        raise ValueError("Imported material ranges do not cover every mesh face.")
+
+    target_slots = [material for material, _ in target.material_ids]
+    first_element = {}
+    for index, material in enumerate(target_slots):
+        first_element.setdefault(material, index)
+    source_order = list(dict.fromkeys(face_materials))
+    if prefer_native_slots is None:
+        prefer_native_slots = "OBJ" in mesh.layout_name
+    mapping = ({material: first_element[material]
+                for material in source_order if material in first_element}
+               if prefer_native_slots else {})
+    free = [index for index in range(len(target_slots)) if index not in mapping.values()]
+    for material in source_order:
+        if material not in mapping:
+            mapping[material] = free.pop(0) if free else len(target_slots) - 1
+
+    buckets = [[] for _ in target_slots]
+    for face_index, material in enumerate(face_materials):
+        buckets[mapping[material]].append(face_index)
+    order = [face_index for bucket in buckets for face_index in bucket]
+    return replace(
+        mesh,
+        faces=[mesh.faces[index] for index in order],
+        uv_indices=[mesh.uv_indices[index] for index in order],
+        material_ids=[(material, len(buckets[index]))
+                      for index, material in enumerate(target_slots)],
+    )
+
+
 def _load_obj_mesh_for_swap(path: Path, axes: str = "Jade Z-up"):
     """OBJ corners retain independent position/UV/normal indices and materials."""
     text = path.read_text(encoding="utf-8-sig", errors="replace")
@@ -385,7 +450,7 @@ def _load_obj_mesh_for_swap(path: Path, axes: str = "Jade Z-up"):
     positions, texcoords, source_normals = [], [], []
     vertices, normals, faces, uv_faces, materials = [], [], [], [], []
     lookup, material_lookup, libraries = {}, {}, []
-    material = 0
+    material = _obj_material_id("", material_lookup)
     # Old Lab exports omitted vn and s despite sharing smooth native vertices.
     # Keep the OBJ default for other producers and honor explicit s commands.
     smoothing = "1" if text.splitlines()[:1] == ["# Exported by PoP BF Lab"] else "off"
@@ -418,8 +483,7 @@ def _load_obj_mesh_for_swap(path: Path, axes: str = "Jade Z-up"):
                 else: texcoords.append(_standard_uv_to_jade((v[0], v[1])))
             elif op == "usemtl":
                 name = " ".join(values)
-                if name not in material_lookup: material_lookup[name] = len(material_lookup)
-                material = material_lookup[name]
+                material = _obj_material_id(name, material_lookup)
             elif op == "s": smoothing = values[0] if values else "off"
             elif op in ("o", "g"): groups.append(" ".join(values))
             elif op == "mtllib": libraries.append(" ".join(values))
@@ -504,8 +568,15 @@ def _mesh_vertex_normals(vertices, faces):
             else (0.0, 0.0, 1.0) for n in normals]
 
 
+def _rli_cooked_color(color: bytes) -> bytes:
+    """Convert Jade's in-file RGBA colour to Direct3D-ready BGRA."""
+    if len(color) != 4:
+        raise ValueError("A Jade vertex colour must contain four bytes.")
+    return bytes((color[2], color[1], color[0], color[3]))
+
+
 def _mesh_rli_replacements(data: bytes, target: MeshInfo, mesh: MeshInfo) -> dict[int, bytes]:
-    """Rebuild primary and cooked instance lighting tables (Toolkit Rli.cpp)."""
+    """Rebuild Jade-internal and Direct3D-cooked instance lighting tables."""
     entries = _parse_pop_file_entries(data)
     expanded = list(dict.fromkeys(pair for f, uv in zip(mesh.faces, mesh.uv_indices) for pair in zip(f, uv)))
     updates = {}
@@ -577,11 +648,17 @@ def _mesh_rli_replacements(data: bytes, target: MeshInfo, mesh: MeshInfo) -> dic
         if end + 4 > len(payload) or struct.unpack_from("<I", payload, end)[0] != 1:
             raise ValueError("Unrecognized primary RLI table.")
         colors = [payload[start+i*4:start+i*4+4] for i in range(len(target.vertices))]
-        # The fourth byte is an RLI validity flag.  Jade Toolkit always emits
-        # FE for rebuilt primary and expanded tables; interpolating/preserving
-        # arbitrary alpha here can activate unintended material blending.
-        new_colors = [color[:3] + b"\xfe" for color in
-                      jade_mesh.transfer_colors(target.vertices, mesh.vertices, colors)]
+        # The primary table is Jade's internal RGBA baked lighting.  The engine
+        # multiplies it with the texture: white is therefore overbright, while
+        # RGB interpolation carries room casts onto edited geometry.  Transfer
+        # only scalar luminance and force Jade's RLI validity byte.
+        new_colors = jade_mesh.transfer_colors(
+            target.vertices, mesh.vertices, colors, alpha=0xFE)
+        # The expanded table is already GPU-friendly.  GX8BuildUVs.c applies
+        # Gx8_M_ConvertColor (R/B swap) while building this representation.
+        # Retail T2T data confirms this distinction; writing primary RGBA here
+        # was the direct cause of red/blue replacement tints.
+        cooked_colors = [_rli_cooked_color(color) for color in new_colors]
         tail = payload[end:]
         for offset in range(0, min(80, len(tail)-15), 4):
             tag, size, count, stride = struct.unpack_from("<4I", tail, offset)
@@ -591,7 +668,8 @@ def _mesh_rli_replacements(data: bytes, target: MeshInfo, mesh: MeshInfo) -> dic
             if old_end > len(tail):
                 raise ValueError("Truncated expanded RLI buffer.")
             block = struct.pack("<4I", tag, 8 + len(expanded)*12, len(expanded), 12)
-            block += b"".join(new_colors[vi] + struct.pack("<2f", -1, -1) for vi, _ in expanded)
+            block += b"".join(cooked_colors[vi] + struct.pack("<2f", -1, -1)
+                              for vi, _ in expanded)
             tail = tail[:offset] + block + tail[old_end:]
             break
         updates[entry.index] = (raw[:4] + payload[:pos] + b"\xff\xff" + struct.pack("<I", len(new_colors))

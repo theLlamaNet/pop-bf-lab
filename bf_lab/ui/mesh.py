@@ -19,6 +19,7 @@ from ..materials import (
 from ..mesh_import import (
     _build_static_mesh_replacement,
     _load_mesh_for_swap,
+    _align_mesh_materials_to_target,
     _mesh_rli_replacements,
 )
 from ..mesh_uv import _jade_uv_to_standard
@@ -448,7 +449,7 @@ class MeshEditorMixin:
                 f"{mesh.layout_name}; {len(mesh.source_joint_names)} source joints. "
                 "Enable 'Import and replace materials' to replace the selected mesh's existing material slots. "
                 "Extra imported slots are not added; when disabled, or when the import has no textures, the mesh retains its BF materials. "
-                "BF character: original rig with weights recalculated by proximity. Static meshes transfer baked lighting. Export in the rest pose."
+                "BF character: original rig with weights recalculated by proximity. Static meshes transfer achromatic baked-light levels so vertex colours cannot tint imported textures. Export in the rest pose."
             ))
             self._log(f"OK    Mesh replacement import: {path.name} -> {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
         except Exception as exc:
@@ -478,14 +479,22 @@ class MeshEditorMixin:
             if entry.key != target.key:
                 raise ValueError("The selection no longer matches the asset: rescan it.")
             candidate = jade_mesh.fitted_mesh(self._swap_mesh, target) if self._mesh_fit_target.get() else self._swap_mesh
-            updates = _mesh_rli_replacements(data, target, candidate)
-            original_candidate = candidate
+            updates = {}
             additions = []
+            materials_replaced = False
             if self._mesh_import_materials.get():
+                before_material_import = candidate
                 candidate, updates, additions = import_mesh_materials(
                     data, target, candidate, self._swap_mesh_textures,
                     self._swap_mesh_material_textures, self._swap_mesh_material_colors, updates)
-            replacement = _build_static_mesh_replacement(data, target, candidate, candidate is not original_candidate)
+                materials_replaced = candidate is not before_material_import
+            candidate = _align_mesh_materials_to_target(
+                candidate, target,
+                prefer_native_slots=("OBJ" in self._swap_mesh.layout_name
+                                     or materials_replaced))
+            updates.update(_mesh_rli_replacements(data, target, candidate))
+            replacement = _build_static_mesh_replacement(
+                data, target, candidate, materials_replaced)
             updates[entry.index] = replacement
             collision_additions = []
             if self._mesh_recalculate_collision.get():
