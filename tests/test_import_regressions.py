@@ -10,7 +10,8 @@ import jade_mesh
 from bf_lab.models import MeshInfo
 from bf_lab.mesh_import import _mesh_rli_replacements, _build_static_mesh_replacement
 from bf_lab.mesh_material_import import import_mesh_materials
-from bf_lab.materials import _scan_pop_materials, _associate_mesh_material_packs
+from bf_lab.materials import (_scan_pop_materials, _scan_pop_material_records,
+                              _scan_pop_material_import_records, _associate_mesh_material_packs)
 from bf_lab.mesh_parser import _scan_pop_meshes
 from bf_lab.resources import _parse_pop_file_entries
 from bf_lab.archives import _patch_texture_key_in_asset
@@ -50,17 +51,51 @@ def fixture():
 
 
 class RegressionTests(unittest.TestCase):
-    def test_materials_that_fit_reuse_keys_without_new_resources(self):
+    def test_imported_material_never_overwrites_native_slot(self):
         data,target=fixture()
         mesh=replace(target,material_ids=[(19,1)])
         candidate,updates,additions=import_mesh_materials(
             data,target,mesh,{77:Image.new('RGBA',(8,8),'red')},{19:77},{},{})
-        self.assertEqual(additions,[])
-        self.assertEqual(candidate.material_ids,[(0,1)])
-        self.assertEqual(struct.unpack_from('<I',updates[2],44)[0],300)
-        self.assertEqual(struct.unpack_from('<I',updates[3],0)[0],300)
+        self.assertEqual(len(additions),2)
+        texture_key,texture_raw=additions[0]
+        material_key,material_raw=additions[1]
+        self.assertEqual(texture_key>>24,0x7A)
+        self.assertEqual(material_key>>24,0x7A)
+        self.assertEqual(candidate.material_ids,[(1,1)])
+        self.assertNotIn(2,updates)  # native material 201 remains byte-identical
+        self.assertEqual(struct.unpack_from('<I',material_raw,44)[0],texture_key)
+        self.assertEqual(struct.unpack('<5I',updates[1]),(4,0,2,201,material_key))
+        self.assertNotIn(4,updates)  # the GAO keeps its native GRM key
+        self.assertEqual(struct.unpack_from('<4I',texture_raw,40),(7,8,8,0))
+        self.assertEqual(len(texture_raw)-56,8*8)
 
-    def test_unused_original_slots_are_filled_before_extending_pack(self):
+    def test_transparent_import_uses_appended_dxt5_and_pot_surface(self):
+        data,target=fixture()
+        image=Image.new('RGBA',(300,190),(20,40,60,127))
+        candidate,updates,additions=import_mesh_materials(
+            data,target,replace(target,material_ids=[(8,1)]),{77:image},{8:77},{},{})
+        self.assertEqual(candidate.material_ids,[(1,1)])
+        key,raw=additions[0]
+        self.assertEqual(key>>24,0x7A)
+        self.assertEqual(struct.unpack_from('<4I',raw,40),(7,256,128,0))
+        self.assertEqual(len(raw)-56,256*128)
+        self.assertEqual(struct.unpack_from('<I',additions[1][1],44)[0],key)
+
+    def test_opaque_import_removes_donor_alpha_blending(self):
+        data,target=fixture()
+        entries=_parse_pop_file_entries(data)
+        material=bytearray(data[entries[2].data_offset:entries[2].data_offset+entries[2].size])
+        struct.pack_into('<I',material,28,0x10017)  # alpha blend + alpha test donor
+        data=data[:entries[2].offset]+resource(entries[2].key,material)+data[entries[2].data_offset+entries[2].size:]
+        target=_scan_pop_meshes(data)[0]
+        _associate_mesh_material_packs(data,[target])
+        _candidate,_updates,additions=import_mesh_materials(
+            data,target,target,{77:Image.new('RGBA',(8,8),(10,20,30,0))},{0:77},{}, {})
+        leaf=additions[1][1]
+        self.assertEqual(struct.unpack_from('<I',leaf,28)[0],0x7)
+        self.assertEqual(struct.unpack_from('<f',leaf,24)[0],1.0)
+
+    def test_imported_leaves_are_appended_without_replacing_native_slots(self):
         data,target=fixture()
         es=_parse_pop_file_entries(data)
         leaf=data[es[2].data_offset:es[2].data_offset+es[2].size]
@@ -69,9 +104,25 @@ class RegressionTests(unittest.TestCase):
         mesh=replace(target,material_ids=[(9,1),(12,1)])
         candidate,updates,additions=import_mesh_materials(
             data,target,mesh,{77:Image.new('RGBA',(8,8),'red')},{9:77,12:77},{},{})
-        self.assertEqual(candidate.material_ids,[(0,1),(1,1)])
-        self.assertEqual(additions,[])
-        self.assertEqual(struct.unpack('<5I',updates[1]),(4,0,2,201,202))
+        self.assertEqual(candidate.material_ids,[(2,1),(3,1)])
+        self.assertEqual(len(additions),3)  # shared texture and two cloned leaves
+        pack=struct.unpack('<7I',updates[1])
+        self.assertEqual(pack,(4,0,4,201,202,additions[1][0],additions[2][0]))
+
+    def test_private_pack_rejects_backward_native_leaf_reference(self):
+        from bf_lab.material_stream import insert_material_resources, validate_material_resources
+        data,_target=fixture()
+        entries=_parse_pop_file_entries(data)
+        leaf=bytearray(data[entries[2].data_offset:entries[2].data_offset+entries[2].size])
+        struct.pack_into('<I',leaf,44,900)
+        additions=[
+            (900,entries[0].magic,struct.pack('<I',900)+texture()[4:]),
+            (901,entries[0].magic,leaf),
+            (902,entries[0].magic,struct.pack('<5I',4,0,2,201,901)),
+        ]
+        broken=insert_material_resources(data,additions)
+        with self.assertRaisesRegex(ValueError,'Invalid Jade load order'):
+            validate_material_resources(broken,{900,901,902})
 
     def test_collider_welds_seams_and_rebuilds_adjacency(self):
         from bf_lab.mesh_collision import build_mesh_collider
@@ -177,7 +228,9 @@ class RegressionTests(unittest.TestCase):
         index=len(_parse_pop_file_entries(data))
         project.resource_additions[0]={index:(999,0x12345678,texture())}
         result=project.apply_mesh_patches(0,data+footer)
-        self.assertEqual([e.key for e in _parse_pop_file_entries(result)[-2:]], [999,0x0FF7C0DE])
+        result_entries=_parse_pop_file_entries(result)
+        self.assertLess(next(e.offset for e in result_entries if e.key==999),
+                        next(e.offset for e in result_entries if e.key==0x0FF7C0DE))
         self.assertEqual(project.apply_mesh_patches(0,result),result)
 
     def test_lighting_exact_and_interpolation(self):
@@ -185,12 +238,47 @@ class RegressionTests(unittest.TestCase):
         got=jade_mesh.transfer_colors([(0,0,0),(2,0,0)],[(0,0,0),(1,0,0)],colors)
         self.assertEqual(got,[colors[0],bytes([40,60,80,253])])
 
+    def test_lighting_obj_precision_uses_first_duplicate_seam_color(self):
+        colors=[bytes([10,20,30,253]),bytes([200,210,220,255]),bytes([70,80,90,254])]
+        got=jade_mesh.transfer_colors(
+            [(1.23456789,2.,3.),(1.23456789,2.,3.),(5.,2.,3.)],
+            [(1.2345679,2.,3.)], colors)
+        self.assertEqual(got,[colors[0]])
+
     def test_rli_new_vertices_are_not_white(self):
         data,target=fixture()
         mesh=replace(target,vertices=[(x+.1,y,z) for x,y,z in target.vertices])
         updates=_mesh_rli_replacements(data,target,mesh)
         self.assertEqual(len(updates),1)
         self.assertIn(bytes([30,40,50,254])*3,next(iter(updates.values())))
+
+    def test_rebuilt_rli_normalizes_engine_validity_byte(self):
+        data,target=fixture()
+        entries=_parse_pop_file_entries(data)
+        gao=entries[-1]
+        raw=bytearray(data[gao.data_offset:gao.data_offset+gao.size])
+        marker=raw.index(b'\xff\xff'+struct.pack('<I',3))
+        raw[marker+9]=253
+        data=data[:gao.offset]+resource(gao.key,raw)+data[gao.data_offset+gao.size:]
+        target=_scan_pop_meshes(data)[0]
+        _associate_mesh_material_packs(data,[target])
+        result=next(iter(_mesh_rli_replacements(data,target,target).values()))
+        marker=result.index(b'\xff\xff'+struct.pack('<I',3))
+        self.assertEqual(result[marker+9],254)
+
+    def test_kind7_material_uses_unaligned_toolkit_texture_offset(self):
+        raw=bytearray(50)
+        struct.pack_into('<II',raw,0,5,7)
+        struct.pack_into('<I',raw,46,0x13572468)
+        data=resource(0x40000001,raw)
+        record=_scan_pop_material_import_records(data)[0x40000001]
+        self.assertEqual(record.texture_key,0x13572468)
+        self.assertEqual(record.texture_offset,12+46)
+
+    def test_retail_preview_keeps_neutral_material_tint(self):
+        data,_target=fixture()
+        record=_scan_pop_material_records(data)[201]
+        self.assertEqual(record.diffuse_color,0xFFFFFFFF)
 
     def test_resize_surface_preserves_file_params(self):
         data=resource(300,texture())
@@ -232,8 +320,8 @@ class RegressionTests(unittest.TestCase):
         data,target=fixture()
         mesh=replace(target,faces=target.faces*2,uv_indices=target.uv_indices*2,material_ids=[(4,1),(9,1)])
         candidate,updates,additions=import_mesh_materials(data,target,mesh,{77:Image.new('RGBA',(8,8),'red')},{4:77,9:77},{}, {})
-        self.assertEqual(candidate.material_ids,[(0,1),(1,1)])
-        self.assertEqual(len(additions),2) # only the excess material and its texture
+        self.assertEqual(candidate.material_ids,[(1,1),(2,1)])
+        self.assertEqual(len(additions),3) # private texture and two appended leaves
         updates[0]=_build_static_mesh_replacement(data,target,candidate,True)
         entries=_parse_pop_file_entries(data)
         project=JadeProject()
@@ -244,11 +332,12 @@ class RegressionTests(unittest.TestCase):
         meshes=_scan_pop_meshes(result)
         _associate_mesh_material_packs(result,meshes)
         packs,_=_scan_pop_materials(result)
-        self.assertEqual(meshes[0].material_ids,[(0,1),(1,1)])
-        self.assertEqual(len(packs[meshes[0].material_pack_key]),2)
+        self.assertEqual(meshes[0].material_ids,[(1,1),(2,1)])
+        self.assertEqual(len(packs[meshes[0].material_pack_key]),3)
         self.assertEqual(len(_scan_pop_textures(result)),2)
         self.assertEqual(meshes[0].material_pack_key, 200)
-        self.assertEqual(packs[200][0], 201) # original slot/key reused
+        self.assertEqual(len(packs[200]),3)
+        self.assertEqual(packs[200][0], 201) # original slot/key preserved
         self.assertEqual(sum(e.key==201 for e in _parse_pop_file_entries(result)),1)
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'materials.dec'
@@ -262,9 +351,15 @@ class RegressionTests(unittest.TestCase):
         mesh=replace(target,faces=target.faces*2,uv_indices=target.uv_indices*2,material_ids=[(4,1),(9,1)])
         candidate,updates,additions=import_mesh_materials(data,target,mesh,{77:Image.new('RGBA',(7,5),'red')},{4:77},{}, {})
         pack=updates[1]
-        self.assertEqual(struct.unpack_from('<I',pack,16)[0],201)
-        texture_raw=updates[3]
-        self.assertEqual(struct.unpack_from('<III',texture_raw,40),(0,7,5))
+        self.assertEqual(candidate.material_ids,[(1,1),(2,1)])
+        imported_material,fallback_material=struct.unpack_from('<2I',pack,16)
+        self.assertEqual(imported_material,additions[1][0])
+        self.assertEqual(fallback_material,additions[2][0])
+        self.assertNotIn(201,(imported_material,fallback_material))
+        self.assertEqual(struct.unpack_from('<I',additions[2][1],44)[0],300)
+        self.assertEqual(len(additions),3)  # texture, textured leaf, fallback clone
+        texture_raw=additions[0][1]
+        self.assertEqual(struct.unpack_from('<4I',texture_raw,40),(7,8,4,0))
 
     def test_obj_attached_texture_is_available_for_apply(self):
         from bf_lab.mesh_import import _load_obj_mesh_for_swap
@@ -275,5 +370,18 @@ class RegressionTests(unittest.TestCase):
             (root/'mesh.obj').write_text('mtllib mesh.mtl\nv 0 0 0\nv 1 0 0\nv 0 1 0\nusemtl paint\nf 1 2 3\n')
             mesh,images,textures,colors=_load_obj_mesh_for_swap(root/'mesh.obj')
             self.assertIn(textures[mesh.material_ids[0][0]],images)
+            self.assertEqual(images[textures[mesh.material_ids[0][0]]].getextrema()[3],(255,255))
+
+    def test_obj_axes_default_to_jade_and_allow_gltf_conversion(self):
+        from bf_lab.mesh_import import _load_obj_mesh_for_swap
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            body='v 0 1 2\nv 1 1 2\nv 0 2 2\nf 1 2 3\n'
+            (root/'generic.obj').write_text(body)
+            (root/'lab.obj').write_text('# Exported by PoP BF Lab\n'+body)
+            generic,*_=_load_obj_mesh_for_swap(root/'generic.obj')
+            gltf,*_=_load_obj_mesh_for_swap(root/'lab.obj','glTF Y-up')
+            self.assertEqual(generic.vertices[0],(0.0,1.0,2.0))
+            self.assertEqual(gltf.vertices[0],(0.0,-2.0,1.0))
 
 if __name__=='__main__': unittest.main()

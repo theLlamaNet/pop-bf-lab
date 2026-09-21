@@ -275,15 +275,23 @@ def transfer_colors(old_vertices, new_vertices, colors):
     """Resample baked lighting; alpha is a Jade flag, not an interpolant."""
     if not colors:
         raise ValueError('Cannot transfer an empty lighting table.')
+    # OBJ round-tripping truncates coordinates, so byte-identical comparisons
+    # miss vertices that are still the same Jade point.  MeshSwap uses a
+    # three-decimal position key and first-wins semantics for duplicated seam
+    # vertices; preserve that before interpolating genuinely new topology.
+    quantized = {}
+    for vertex, color in zip(old_vertices, colors):
+        quantized.setdefault(tuple(round(value, 3) for value in vertex), color)
     tree = NearestPoints(old_vertices, range(len(colors)))
     result, cache = [], {}
     for vertex in new_vertices:
         point = tuple(vertex)
         if point not in cache:
-            near = tree.nearest(point)
-            if near[0][0] < 1e-18:
-                value = colors[near[0][1]]
+            key = tuple(round(value, 3) for value in point)
+            if key in quantized:
+                value = quantized[key]
             else:
+                near = tree.nearest(point)
                 weights = [(1.0 / max(d, 1e-18), i) for d, i in near]
                 total = sum(w for w, _ in weights)
                 value = bytes(round(sum(w * colors[i][c] for w, i in weights) / total)

@@ -555,7 +555,21 @@ def _mesh_rli_replacements(data: bytes, target: MeshInfo, mesh: MeshInfo) -> dic
                     break
             continue
         marker = b"\xff\xff" + struct.pack("<I", len(target.vertices))
-        pos = payload.find(marker, visual, min(visual + 69, len(payload)))
+        search_at, search_end, pos = visual, min(visual + 69, len(payload)), -1
+        while search_at < search_end:
+            candidate = payload.find(marker, search_at, search_end)
+            if candidate < 0:
+                break
+            first = candidate + 6
+            last = first + len(target.vertices) * 4
+            sample = min(64, len(target.vertices))
+            valid_alphas = sum(payload[first + i*4 + 3] in (0xFD, 0xFE, 0xFF)
+                               for i in range(sample)) if last <= len(payload) else 0
+            if (last + 4 <= len(payload) and struct.unpack_from("<I", payload, last)[0] == 1
+                    and (not sample or valid_alphas * 10 >= sample * 9)):
+                pos = candidate
+                break
+            search_at = candidate + 1
         if pos < 0:
             continue
         start = pos + 6
@@ -563,7 +577,11 @@ def _mesh_rli_replacements(data: bytes, target: MeshInfo, mesh: MeshInfo) -> dic
         if end + 4 > len(payload) or struct.unpack_from("<I", payload, end)[0] != 1:
             raise ValueError("Unrecognized primary RLI table.")
         colors = [payload[start+i*4:start+i*4+4] for i in range(len(target.vertices))]
-        new_colors = jade_mesh.transfer_colors(target.vertices, mesh.vertices, colors)
+        # The fourth byte is an RLI validity flag.  Jade Toolkit always emits
+        # FE for rebuilt primary and expanded tables; interpolating/preserving
+        # arbitrary alpha here can activate unintended material blending.
+        new_colors = [color[:3] + b"\xfe" for color in
+                      jade_mesh.transfer_colors(target.vertices, mesh.vertices, colors)]
         tail = payload[end:]
         for offset in range(0, min(80, len(tail)-15), 4):
             tag, size, count, stride = struct.unpack_from("<4I", tail, offset)

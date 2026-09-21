@@ -35,7 +35,9 @@ def insert_material_resources(data, additions):
         raise ValueError('No native texture loading phase found for imported materials.')
     descriptors = [e for e, raw in textures if len(raw) <= texture_header_size(raw)+4]
     material_at = textures[0][0].offset
-    descriptor_at = max((e.data_offset+e.size for e in descriptors), default=material_at)
+    fulls = [e for e, raw in textures if e not in descriptors]
+    if not fulls:
+        raise ValueError('No native full texture loading phase found for imported materials.')
     packs, leaves, headers, pixels = [], [], [], []
     for key, magic, raw in pending:
         raw = bytes(raw)
@@ -44,19 +46,29 @@ def insert_material_resources(data, additions):
         if is_texture(raw):
             raw = struct.pack('<I', key)+raw[4:]
             if descriptors:
-                headers.append(record(raw[:texture_header_size(raw)]))
-            pixels.append(record(raw))
+                headers.append((key, record(raw[:texture_header_size(raw)])))
+            pixels.append((key, record(raw)))
         elif struct.unpack_from('<I', raw)[0] == 4:
             packs.append(record(raw))
         elif struct.unpack_from('<I', raw)[0] == 5:
             leaves.append(record(raw))
         else:
             raise ValueError('Unsupported imported material dependency.')
-    inserts = {}
-    for offset, blobs in ((material_at, packs+leaves), (descriptor_at, headers), (len(body), pixels)):
-        inserts.setdefault(offset, []).extend(blobs)
+    def wave_offset(wave, key):
+        following = next((entry for entry in wave if entry.key > key), None)
+        return following.offset if following else wave[-1].data_offset + wave[-1].size
+    inserts = {material_at: [(0, blob) for blob in packs+leaves]}
+    for wave, records in ((descriptors, headers), (fulls, pixels)):
+        for key, blob in records:
+            inserts.setdefault(wave_offset(wave, key), []).append((key, blob))
     for offset in sorted(inserts, reverse=True):
-        body = body[:offset]+b''.join(inserts[offset])+body[offset:]
+        # Equal priorities preserve the dependency order assembled above:
+        # private packs first, then their material leaves.  Comparing the blob
+        # as a secondary tuple item can put a smaller leaf record ahead of its
+        # pack and produces a backward Jade load reference.
+        body = body[:offset]+b''.join(
+            blob for _key, blob in sorted(inserts[offset], key=lambda item: item[0])
+        )+body[offset:]
     return body+footer
 
 
@@ -79,8 +91,6 @@ def validate_material_resources(data, keys):
         raw = data[first.data_offset:first.data_offset+first.size]
         children = packs.get(key, [leaves[key]] if key in leaves else [])
         for child in children:
-            if child not in keys:
-                continue  # Existing shared resources may already be cached.
             if child not in by_key or by_key[child][0].offset <= first.offset:
                 raise ValueError(f'Invalid Jade load order: 0x{key:08X} -> 0x{child:08X}.')
         if is_texture(raw):
@@ -91,6 +101,15 @@ def validate_material_resources(data, keys):
                     raise ValueError(f'Texture 0x{key:08X} has a mismatched embedded key.')
             if len(resources) == 2 and resources[0].size > texture_header_size(raw)+4:
                 raise ValueError('Texture pixels precede their descriptor.')
+            header_size = texture_header_size(raw)
+            full = max(resources, key=lambda entry: entry.size)
+            full_raw = data[full.data_offset:full.data_offset+full.size]
+            fmt, width, height = struct.unpack_from('<III', full_raw, 40)
+            blocks = max(1, (width + 3) // 4) * max(1, (height + 3) // 4)
+            expected = {5: blocks * 8, 6: blocks * 16, 7: blocks * 16}.get(fmt)
+            if expected is not None and full.size - header_size != expected:
+                raise ValueError(
+                    f'Texture 0x{key:08X} payload does not match its format/dimensions.')
 
 
 def repair_legacy_material_tail(data):

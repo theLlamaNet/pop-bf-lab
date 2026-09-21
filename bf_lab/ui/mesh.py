@@ -58,17 +58,19 @@ class MeshEditorMixin:
 
         options = ttk.Frame(self.mesh_tab)
         options.pack(fill="x", pady=(0, 6))
+        self._mesh_import_materials = tk.BooleanVar(value=False)
         self._mesh_fit_target = tk.BooleanVar(value=False)
         self._mesh_recalculate_collision = tk.BooleanVar(value=False)
         option_box = ttk.LabelFrame(options, text="Import options", padding=3)
         option_box.pack(side="left")
-        self.mesh_options_tree = ttk.Treeview(option_box, show="tree", height=2, selectmode="browse")
+        self.mesh_options_tree = ttk.Treeview(option_box, show="tree", height=3, selectmode="browse")
         self.mesh_options_tree.column("#0", width=370, stretch=False)
         self.mesh_options_tree.pack(side="left", fill="both")
         option_scroll = ttk.Scrollbar(option_box, orient="vertical", command=self.mesh_options_tree.yview)
         option_scroll.pack(side="right", fill="y")
         self.mesh_options_tree.configure(yscrollcommand=option_scroll.set)
         self._mesh_option_rows = {
+            "materials": (self._mesh_import_materials, "Import and replace materials"),
             "fit": (self._mesh_fit_target, "Fit size and center to the original mesh"),
             "collision": (self._mesh_recalculate_collision, "Recalculate imported mesh collision"),
         }
@@ -444,7 +446,8 @@ class MeshEditorMixin:
                 f"{path.name} - {len(mesh.vertices):,} vertices - {len(mesh.faces):,} faces - "
                 f"{len(material_colors)} materials - {len(textures)} textures\n"
                 f"{mesh.layout_name}; {len(mesh.source_joint_names)} source joints. "
-                "Apply replaces original material slots first and adds excess slots. Meshes without textures retain BF materials. "
+                "Enable 'Import and replace materials' to append private material slots for this mesh. "
+                "When disabled, or when the import has no textures, the mesh retains its BF materials. "
                 "BF character: original rig with weights recalculated by proximity. Static meshes transfer baked lighting. Export in the rest pose."
             ))
             self._log(f"OK    Mesh replacement import: {path.name} -> {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
@@ -477,9 +480,11 @@ class MeshEditorMixin:
             candidate = jade_mesh.fitted_mesh(self._swap_mesh, target) if self._mesh_fit_target.get() else self._swap_mesh
             updates = _mesh_rli_replacements(data, target, candidate)
             original_candidate = candidate
-            candidate, updates, additions = import_mesh_materials(
-                data, target, candidate, self._swap_mesh_textures,
-                self._swap_mesh_material_textures, self._swap_mesh_material_colors, updates)
+            additions = []
+            if self._mesh_import_materials.get():
+                candidate, updates, additions = import_mesh_materials(
+                    data, target, candidate, self._swap_mesh_textures,
+                    self._swap_mesh_material_textures, self._swap_mesh_material_colors, updates)
             replacement = _build_static_mesh_replacement(data, target, candidate, candidate is not original_candidate)
             updates[entry.index] = replacement
             collision_additions = []

@@ -93,7 +93,8 @@ def _classic_jade_material(entry: PopFileEntry, data: bytes) -> MaterialInfo | N
                         opacity_offset=base + 16, texture_offset=base + 24, source_meshes=[])
 
 
-def _modern_jade_material(entry: PopFileEntry, data: bytes) -> MaterialInfo | None:
+def _modern_jade_material(entry: PopFileEntry, data: bytes,
+                          valid_texture_keys: set[int] | None = None) -> MaterialInfo | None:
     """Decode Jade leaf materials (kinds 4..9), including multitexture layers."""
     payload_offset = entry.data_offset + 4
     payload = data[payload_offset:entry.data_offset + entry.size]
@@ -107,11 +108,16 @@ def _modern_jade_material(entry: PopFileEntry, data: bytes) -> MaterialInfo | No
     if base + 4 > len(payload):
         return None
     layer_stride = {8: 26, 9: 39}.get(kind, 0)
+    if ((not layer_stride and len(payload) != base + 4)
+            or (layer_stride and (len(payload) - (base + 4)) % layer_stride)):
+        return None
     offsets = [base]
-    if layer_stride and (len(payload) - (base + 4)) % layer_stride == 0:
+    if layer_stride:
         offsets = list(range(base, len(payload) - 3, layer_stride))
     keys = [struct.unpack_from("<I", payload, off)[0] for off in offsets]
     keys = [key for key in keys if key not in (0, 0xFFFFFFFF)]
+    if valid_texture_keys is not None and keys and not any(key in valid_texture_keys for key in keys):
+        return None
     texture_key = keys[0] if keys else None
     secondary_key = keys[1] if len(keys) > 1 else None
     ambient, diffuse, specular = struct.unpack_from("<III", payload, 4)
@@ -133,7 +139,7 @@ def _modern_jade_material(entry: PopFileEntry, data: bytes) -> MaterialInfo | No
 
 
 def _scan_pop_material_records(data: bytes, valid_texture_keys: set[int] | None = None) -> dict[int, MaterialInfo]:
-    """Read the Jade type-5 material records used by the Blender Addon."""
+    """Read the Jade type-5 material records used by the editor preview."""
     records: dict[int, MaterialInfo] = {}
     for entry in _parse_pop_file_entries(data):
         if entry.data_type != 5 or entry.size < 16:
@@ -145,11 +151,11 @@ def _scan_pop_material_records(data: bytes, valid_texture_keys: set[int] | None 
             blob = data[entry.data_offset:entry.data_offset + entry.size]
             r = _PopReader(blob[4:])
             version = r.u32()
-            # POP's type-5 payload starts with a serialization version, not a
-            # Jade leaf-material kind. Versions 4..9 used to be mistaken for
-            # kind 4..9 and produced random/white texture assignments.
+            # Keep this retail interpretation for display.  Treating every
+            # 4..9 word as a Toolkit leaf kind exposes engine colour words as
+            # OpenGL modulation colours (solid blue/red over valid textures).
             if not 3 <= version <= 9:
-                modern = _modern_jade_material(entry, data)
+                modern = _modern_jade_material(entry, data, valid_texture_keys)
                 if modern is not None:
                     modern.index = len(records)
                     modern.material_id = len(records)
@@ -201,6 +207,27 @@ def _scan_pop_material_records(data: bytes, valid_texture_keys: set[int] | None 
             )
         except (ValueError, struct.error):
             continue
+    return records
+
+
+def _scan_pop_material_import_records(
+        data: bytes, valid_texture_keys: set[int] | None = None) -> dict[int, MaterialInfo]:
+    """Return write targets using Toolkit's exact kind-dependent key offsets.
+
+    Preview colour semantics deliberately remain in _scan_pop_material_records;
+    this stricter view is only for cloning/patching material dependencies.
+    """
+    records = _scan_pop_material_records(data, valid_texture_keys)
+    for entry in _parse_pop_file_entries(data):
+        if entry.data_type != 5:
+            continue
+        modern = _modern_jade_material(entry, data, valid_texture_keys)
+        if modern is None:
+            continue
+        previous = records.get(entry.key)
+        modern.index = previous.index if previous is not None else len(records)
+        modern.material_id = previous.material_id if previous is not None else len(records)
+        records[entry.key] = modern
     return records
 
 
