@@ -446,8 +446,8 @@ class MeshEditorMixin:
                 f"{path.name} - {len(mesh.vertices):,} vertices - {len(mesh.faces):,} faces - "
                 f"{len(material_colors)} materials - {len(textures)} textures\n"
                 f"{mesh.layout_name}; {len(mesh.source_joint_names)} source joints. "
-                "Enable 'Import and replace materials' to append private material slots for this mesh. "
-                "When disabled, or when the import has no textures, the mesh retains its BF materials. "
+                "Enable 'Import and replace materials' to replace the selected mesh's existing material slots. "
+                "Extra imported slots are not added; when disabled, or when the import has no textures, the mesh retains its BF materials. "
                 "BF character: original rig with weights recalculated by proximity. Static meshes transfer baked lighting. Export in the rest pose."
             ))
             self._log(f"OK    Mesh replacement import: {path.name} -> {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")

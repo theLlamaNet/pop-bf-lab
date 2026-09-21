@@ -51,20 +51,17 @@ def fixture():
 
 
 class RegressionTests(unittest.TestCase):
-    def test_imported_material_never_overwrites_native_slot(self):
+    def test_imported_material_reuses_native_slot_without_new_leaf(self):
         data,target=fixture()
         mesh=replace(target,material_ids=[(19,1)])
         candidate,updates,additions=import_mesh_materials(
             data,target,mesh,{77:Image.new('RGBA',(8,8),'red')},{19:77},{},{})
-        self.assertEqual(len(additions),2)
+        self.assertEqual(len(additions),1)
         texture_key,texture_raw=additions[0]
-        material_key,material_raw=additions[1]
         self.assertEqual(texture_key>>24,0x7A)
-        self.assertEqual(material_key>>24,0x7A)
-        self.assertEqual(candidate.material_ids,[(1,1)])
-        self.assertNotIn(2,updates)  # native material 201 remains byte-identical
-        self.assertEqual(struct.unpack_from('<I',material_raw,44)[0],texture_key)
-        self.assertEqual(struct.unpack('<5I',updates[1]),(4,0,2,201,material_key))
+        self.assertEqual(candidate.material_ids,[(0,1)])
+        self.assertEqual(struct.unpack_from('<I',updates[2],44)[0],texture_key)
+        self.assertNotIn(1,updates)  # native GRM is not enlarged
         self.assertNotIn(4,updates)  # the GAO keeps its native GRM key
         self.assertEqual(struct.unpack_from('<4I',texture_raw,40),(7,8,8,0))
         self.assertEqual(len(texture_raw)-56,8*8)
@@ -74,12 +71,12 @@ class RegressionTests(unittest.TestCase):
         image=Image.new('RGBA',(300,190),(20,40,60,127))
         candidate,updates,additions=import_mesh_materials(
             data,target,replace(target,material_ids=[(8,1)]),{77:image},{8:77},{},{})
-        self.assertEqual(candidate.material_ids,[(1,1)])
+        self.assertEqual(candidate.material_ids,[(0,1)])
         key,raw=additions[0]
         self.assertEqual(key>>24,0x7A)
         self.assertEqual(struct.unpack_from('<4I',raw,40),(7,256,128,0))
         self.assertEqual(len(raw)-56,256*128)
-        self.assertEqual(struct.unpack_from('<I',additions[1][1],44)[0],key)
+        self.assertEqual(struct.unpack_from('<I',updates[2],44)[0],key)
 
     def test_opaque_import_removes_donor_alpha_blending(self):
         data,target=fixture()
@@ -91,11 +88,11 @@ class RegressionTests(unittest.TestCase):
         _associate_mesh_material_packs(data,[target])
         _candidate,_updates,additions=import_mesh_materials(
             data,target,target,{77:Image.new('RGBA',(8,8),(10,20,30,0))},{0:77},{}, {})
-        leaf=additions[1][1]
+        leaf=_updates[2]
         self.assertEqual(struct.unpack_from('<I',leaf,28)[0],0x7)
         self.assertEqual(struct.unpack_from('<f',leaf,24)[0],1.0)
 
-    def test_imported_leaves_are_appended_without_replacing_native_slots(self):
+    def test_imported_materials_use_existing_slots_and_cap_extra_groups(self):
         data,target=fixture()
         es=_parse_pop_file_entries(data)
         leaf=data[es[2].data_offset:es[2].data_offset+es[2].size]
@@ -104,10 +101,11 @@ class RegressionTests(unittest.TestCase):
         mesh=replace(target,material_ids=[(9,1),(12,1)])
         candidate,updates,additions=import_mesh_materials(
             data,target,mesh,{77:Image.new('RGBA',(8,8),'red')},{9:77,12:77},{},{})
-        self.assertEqual(candidate.material_ids,[(2,1),(3,1)])
-        self.assertEqual(len(additions),3)  # shared texture and two cloned leaves
-        pack=struct.unpack('<7I',updates[1])
-        self.assertEqual(pack,(4,0,4,201,202,additions[1][0],additions[2][0]))
+        self.assertEqual(candidate.material_ids,[(0,2)])
+        self.assertEqual(len(additions),1)
+        native_leaf_index=next(entry.index for entry in _parse_pop_file_entries(data) if entry.key==201)
+        self.assertEqual(struct.unpack_from('<I',updates[native_leaf_index],44)[0],additions[0][0])
+        self.assertNotIn(1,updates)
 
     def test_private_pack_rejects_backward_native_leaf_reference(self):
         from bf_lab.material_stream import insert_material_resources, validate_material_resources
@@ -316,12 +314,12 @@ class RegressionTests(unittest.TestCase):
         self.assertIs(candidate,mesh)
         self.assertEqual(additions,[])
 
-    def test_extra_slots_resources_save_and_reload(self):
+    def test_extra_imported_slots_do_not_expand_the_native_pack(self):
         data,target=fixture()
         mesh=replace(target,faces=target.faces*2,uv_indices=target.uv_indices*2,material_ids=[(4,1),(9,1)])
         candidate,updates,additions=import_mesh_materials(data,target,mesh,{77:Image.new('RGBA',(8,8),'red')},{4:77,9:77},{}, {})
-        self.assertEqual(candidate.material_ids,[(1,1),(2,1)])
-        self.assertEqual(len(additions),3) # private texture and two appended leaves
+        self.assertEqual(candidate.material_ids,[(0,2)])
+        self.assertEqual(len(additions),1) # texture only; no private material leaves
         updates[0]=_build_static_mesh_replacement(data,target,candidate,True)
         entries=_parse_pop_file_entries(data)
         project=JadeProject()
@@ -332,11 +330,11 @@ class RegressionTests(unittest.TestCase):
         meshes=_scan_pop_meshes(result)
         _associate_mesh_material_packs(result,meshes)
         packs,_=_scan_pop_materials(result)
-        self.assertEqual(meshes[0].material_ids,[(1,1),(2,1)])
-        self.assertEqual(len(packs[meshes[0].material_pack_key]),3)
+        self.assertEqual(meshes[0].material_ids,[(0,2)])
+        self.assertEqual(len(packs[meshes[0].material_pack_key]),1)
         self.assertEqual(len(_scan_pop_textures(result)),2)
         self.assertEqual(meshes[0].material_pack_key, 200)
-        self.assertEqual(len(packs[200]),3)
+        self.assertEqual(len(packs[200]),1)
         self.assertEqual(packs[200][0], 201) # original slot/key preserved
         self.assertEqual(sum(e.key==201 for e in _parse_pop_file_entries(result)),1)
         with tempfile.TemporaryDirectory() as directory:
@@ -350,14 +348,9 @@ class RegressionTests(unittest.TestCase):
         data,target=fixture()
         mesh=replace(target,faces=target.faces*2,uv_indices=target.uv_indices*2,material_ids=[(4,1),(9,1)])
         candidate,updates,additions=import_mesh_materials(data,target,mesh,{77:Image.new('RGBA',(7,5),'red')},{4:77},{}, {})
-        pack=updates[1]
-        self.assertEqual(candidate.material_ids,[(1,1),(2,1)])
-        imported_material,fallback_material=struct.unpack_from('<2I',pack,16)
-        self.assertEqual(imported_material,additions[1][0])
-        self.assertEqual(fallback_material,additions[2][0])
-        self.assertNotIn(201,(imported_material,fallback_material))
-        self.assertEqual(struct.unpack_from('<I',additions[2][1],44)[0],300)
-        self.assertEqual(len(additions),3)  # texture, textured leaf, fallback clone
+        self.assertEqual(candidate.material_ids,[(0,2)])
+        self.assertEqual(struct.unpack_from('<I',updates[2],44)[0],additions[0][0])
+        self.assertEqual(len(additions),1)  # texture only; untextured slots retain their native material
         texture_raw=additions[0][1]
         self.assertEqual(struct.unpack_from('<4I',texture_raw,40),(7,8,4,0))
 
