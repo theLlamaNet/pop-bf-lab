@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+import colorsys
 import jade_mesh
 import math
 import queue
@@ -43,6 +44,103 @@ from ..viewports import (
     MeshViewport,
     OpenGLFrame,
 )
+
+
+class VertexColorWheel(ttk.Frame):
+    """Compact HSV hue/saturation wheel with an editable RGB hex value."""
+
+    SIZE = 148
+
+    def __init__(self, master, color_var: tk.StringVar, background: str,
+                 on_change=None):
+        super().__init__(master)
+        self.color_var = color_var
+        self._background = background
+        self._on_change = on_change
+        self.canvas = tk.Canvas(
+            self, width=self.SIZE, height=self.SIZE, background=background,
+            highlightthickness=0, cursor="crosshair")
+        self.canvas.pack(pady=(2, 5))
+        self._image = self._make_image()
+        self.canvas.create_image(0, 0, image=self._image, anchor="nw")
+        self._marker = self.canvas.create_oval(0, 0, 0, 0, outline="white", width=2)
+        self._marker_shadow = self.canvas.create_oval(0, 0, 0, 0, outline="black", width=1)
+        self.canvas.bind("<Button-1>", self._pick)
+        self.canvas.bind("<B1-Motion>", self._pick)
+        self.entry = tk.Entry(
+            self, textvariable=color_var, width=10, justify="center",
+            relief="solid", borderwidth=1)
+        self.entry.pack()
+        self.entry.bind("<Return>", self._hex_changed)
+        self.entry.bind("<FocusOut>", self._hex_changed)
+        self._sync_marker()
+
+    def _make_image(self) -> tk.PhotoImage:
+        image = tk.PhotoImage(width=self.SIZE, height=self.SIZE)
+        center = (self.SIZE - 1) / 2
+        radius = center - 2
+        for y in range(self.SIZE):
+            row = []
+            for x in range(self.SIZE):
+                dx, dy = x - center, center - y
+                saturation = math.hypot(dx, dy) / radius
+                if saturation > 1.0:
+                    row.append(self._background)
+                    continue
+                hue = (math.atan2(dy, dx) / (2 * math.pi)) % 1.0
+                red, green, blue = colorsys.hsv_to_rgb(hue, saturation, 1.0)
+                row.append(f"#{round(red*255):02x}{round(green*255):02x}{round(blue*255):02x}")
+            image.put("{" + " ".join(row) + "}", to=(0, y))
+        return image
+
+    @staticmethod
+    def parse(value: str) -> tuple[int, int, int]:
+        value = value.strip()
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            raise ValueError("Vertex color must use #RRGGBB format.")
+        return tuple(int(value[index:index + 2], 16) for index in (1, 3, 5))
+
+    def _pick(self, event) -> None:
+        center = (self.SIZE - 1) / 2
+        radius = center - 2
+        dx, dy = event.x - center, center - event.y
+        distance = math.hypot(dx, dy)
+        if distance > radius:
+            dx *= radius / distance
+            dy *= radius / distance
+            distance = radius
+        hue = (math.atan2(dy, dx) / (2 * math.pi)) % 1.0
+        red, green, blue = colorsys.hsv_to_rgb(hue, distance / radius, 1.0)
+        self.color_var.set(f"#{round(red*255):02X}{round(green*255):02X}{round(blue*255):02X}")
+        self._sync_marker()
+        if self._on_change is not None:
+            self._on_change()
+
+    def _hex_changed(self, _event=None) -> None:
+        try:
+            red, green, blue = self.parse(self.color_var.get())
+        except ValueError:
+            self.color_var.set("#FFFFFF")
+        else:
+            self.color_var.set(f"#{red:02X}{green:02X}{blue:02X}")
+        self._sync_marker()
+        if self._on_change is not None:
+            self._on_change()
+
+    def _sync_marker(self) -> None:
+        red, green, blue = self.parse(self.color_var.get())
+        hue, saturation, _value = colorsys.rgb_to_hsv(red / 255, green / 255, blue / 255)
+        center = (self.SIZE - 1) / 2
+        radius = center - 2
+        x = center + math.cos(hue * 2 * math.pi) * saturation * radius
+        y = center - math.sin(hue * 2 * math.pi) * saturation * radius
+        for marker, pad in ((self._marker_shadow, 6), (self._marker, 5)):
+            self.canvas.coords(marker, x - pad, y - pad, x + pad, y + pad)
+            self.canvas.tag_raise(marker)
+        foreground = "#111111" if red * 0.30 + green * 0.59 + blue * 0.11 > 150 else "#FFFFFF"
+        self.entry.configure(
+            background=f"#{red:02X}{green:02X}{blue:02X}",
+            foreground=foreground, insertbackground=foreground)
 
 
 class MeshEditorMixin:
@@ -149,11 +247,34 @@ class MeshEditorMixin:
         )
 
         replacement_box = ttk.LabelFrame(replacement_row, text="Imported replacement mesh", padding=6)
+        vertex_color_box = ttk.LabelFrame(replacement_row, text="Vertex color", padding=6)
         imported_materials_box = ttk.LabelFrame(
             replacement_row, text="Materials of imported mesh", padding=5
         )
         replacement_row.add(replacement_box, weight=4)
+        replacement_row.add(vertex_color_box, weight=1)
         replacement_row.add(imported_materials_box, weight=1)
+
+        self._mesh_vertex_color = tk.StringVar(value="#FFFFFF")
+        self._mesh_vertex_intensity = tk.DoubleVar(value=100.0)
+        self.mesh_vertex_color_wheel = VertexColorWheel(
+            vertex_color_box, self._mesh_vertex_color, self._dark["field"],
+            self._preview_mesh_vertex_color)
+        self.mesh_vertex_color_wheel.pack(fill="x")
+        ttk.Label(vertex_color_box, text="Color intensity").pack(anchor="w", pady=(9, 0))
+        intensity_row = ttk.Frame(vertex_color_box)
+        intensity_row.pack(fill="x")
+        self.mesh_vertex_intensity_scale = ttk.Scale(
+            intensity_row, from_=0.0, to=200.0,
+            variable=self._mesh_vertex_intensity,
+            command=self._mesh_vertex_intensity_changed)
+        self.mesh_vertex_intensity_scale.pack(side="left", fill="x", expand=True)
+        self.mesh_vertex_intensity_label = ttk.Label(intensity_row, text="100%", width=5)
+        self.mesh_vertex_intensity_label.pack(side="right", padx=(5, 0))
+        ttk.Label(
+            vertex_color_box,
+            text="White / 100% is neutral. The tint keeps local baked light and shadow.",
+            justify="left", wraplength=175).pack(fill="x", pady=(7, 0))
 
         imported_materials_box.columnconfigure(0, weight=1)
         imported_materials_box.rowconfigure(0, weight=1)
@@ -217,6 +338,29 @@ class MeshEditorMixin:
         self.mesh_options_tree.focus(iid)
         self.mesh_options_tree.selection_set(iid)
         return "break"
+
+    def _mesh_vertex_intensity_changed(self, value=None) -> None:
+        intensity = float(value) if value is not None else self._mesh_vertex_intensity.get()
+        if hasattr(self, "mesh_vertex_intensity_label"):
+            self.mesh_vertex_intensity_label.config(text=f"{round(intensity):d}%")
+        self._preview_mesh_vertex_color()
+
+    def _preview_mesh_vertex_color(self) -> None:
+        if not hasattr(self, "swap_mesh_canvas"):
+            return
+        try:
+            tint, intensity = self._mesh_vertex_color_settings()
+        except (ValueError, tk.TclError):
+            return
+        if OpenGLFrame is not None and isinstance(self.swap_mesh_canvas, MeshViewport):
+            self.swap_mesh_canvas.set_vertex_tint(tint, intensity)
+
+    def _mesh_vertex_color_settings(self) -> tuple[tuple[float, float, float], float]:
+        red, green, blue = VertexColorWheel.parse(self._mesh_vertex_color.get())
+        intensity = self._mesh_vertex_intensity.get() / 100.0
+        if not math.isfinite(intensity) or not 0.0 <= intensity <= 2.0:
+            raise ValueError("Vertex color intensity must be between 0% and 200%.")
+        return (red / 255.0, green / 255.0, blue / 255.0), intensity
 
     def _collect_mesh_render_resources(self, preferred_asset: Asset, data: bytes, meshes: list[MeshInfo]) -> tuple[dict[int, object], dict[int, dict[int, int]], dict[int, dict[int, tuple[float, float, float, float]]], dict[int, list[tuple[int, int | None]]], int]:
         """Resolve local mesh resources first, then search only unresolved keys."""
@@ -449,7 +593,7 @@ class MeshEditorMixin:
                 f"{mesh.layout_name}; {len(mesh.source_joint_names)} source joints. "
                 "Enable 'Import and replace materials' to replace the selected mesh's existing material slots. "
                 "Extra imported slots are not added; when disabled, or when the import has no textures, the mesh retains its BF materials. "
-                "BF character: original rig with weights recalculated by proximity. Static meshes transfer achromatic baked-light levels so vertex colours cannot tint imported textures. Export in the rest pose."
+                "BF character: original rig with weights recalculated by proximity. Static meshes retain local baked-light levels; use Vertex color and Color intensity to tint them manually. Export in the rest pose."
             ))
             self._log(f"OK    Mesh replacement import: {path.name} -> {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
         except Exception as exc:
@@ -492,9 +636,12 @@ class MeshEditorMixin:
                 candidate, target,
                 prefer_native_slots=("OBJ" in self._swap_mesh.layout_name
                                      or materials_replaced))
-            updates.update(_mesh_rli_replacements(data, target, candidate))
+            vertex_tint, color_intensity = self._mesh_vertex_color_settings()
+            updates.update(_mesh_rli_replacements(
+                data, target, candidate, vertex_tint, color_intensity))
             replacement = _build_static_mesh_replacement(
-                data, target, candidate, materials_replaced)
+                data, target, candidate, materials_replaced,
+                vertex_tint, color_intensity)
             updates[entry.index] = replacement
             collision_additions = []
             if self._mesh_recalculate_collision.get():
@@ -544,7 +691,8 @@ class MeshEditorMixin:
             self.status.set("Mesh applied in memory. Save the BF/BIN/DEC to write it to disk.")
             self.mesh_source_label.config(text=f"{asset.name} - meshes applied in memory, ready to save")
             self._log(f"APPLY Mesh 0x{target.key:08X}: {len(updated.vertices)} vertices, {len(updated.faces)} faces; "
-                      f"{len(updated.skin_bones or [])} BF bones retained, weights transferred automatically")
+                      f"{len(updated.skin_bones or [])} BF bones retained, weights transferred automatically; "
+                      f"vertex color {self._mesh_vertex_color.get().upper()} at {color_intensity * 100:.0f}%")
             return True
         except Exception as exc:
             self._log(f"ERROR Mesh apply: {exc}")

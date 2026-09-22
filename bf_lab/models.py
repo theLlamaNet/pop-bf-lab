@@ -87,6 +87,7 @@ class MeshInfo:
     skin_flags: int = 0
     source_joint_names: tuple[str, ...] = ()
     layout_name: str = ""
+    vertex_colors: list[tuple[float, float, float, float]] | None = None
 
 
 @dataclass

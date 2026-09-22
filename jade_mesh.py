@@ -271,7 +271,8 @@ def triangulate_polygon(points):
     return result
 
 
-def transfer_colors(old_vertices, new_vertices, colors, alpha=None):
+def transfer_colors(old_vertices, new_vertices, colors, alpha=None,
+                    tint=None, intensity=1.0):
     """Transfer only baked-light luminance, never its colour cast.
 
     Jade stores its internal 0xAABBGGRR colours as R,G,B,A bytes.  The Direct3D
@@ -284,6 +285,9 @@ def transfer_colors(old_vertices, new_vertices, colors, alpha=None):
     The result is achromatic and therefore cannot tint the texture, while
     retaining the source mesh's local light/shadow level.
 
+    ``tint`` is an RGB multiplier selected by the Mesh Editor.  White keeps the
+    achromatic result; other colours adapt it to the scene without discarding
+    the original local light/shadow level. ``intensity`` controls its strength.
     ``alpha`` forces Jade's RLI sentinel when supplied; GEO point colours keep
     the closest original alpha.
     """
@@ -291,6 +295,12 @@ def transfer_colors(old_vertices, new_vertices, colors, alpha=None):
         raise ValueError('Cannot transfer an empty lighting table.')
     if alpha is not None and not 0 <= alpha <= 255:
         raise ValueError('The forced vertex-colour alpha must be a byte.')
+    tint = (1.0, 1.0, 1.0) if tint is None else tuple(tint)
+    if (len(tint) != 3 or any(not math.isfinite(value) or not 0.0 <= value <= 1.0
+                              for value in tint)):
+        raise ValueError('The vertex-colour tint must contain three RGB values from 0 to 1.')
+    if not math.isfinite(intensity) or not 0.0 <= intensity <= 2.0:
+        raise ValueError('The vertex-colour intensity must be between 0 and 2.')
     count = min(len(old_vertices), len(colors))
     if not count:
         raise ValueError('Lighting table has no corresponding source vertices.')
@@ -324,14 +334,17 @@ def transfer_colors(old_vertices, new_vertices, colors, alpha=None):
                 total = sum(weight for weight, _ in weights)
                 level = round(sum(weight * levels[index] for weight, index in weights) / total)
                 nearest = near[0][1]
-            value = bytes((level, level, level,
+            tinted = tuple(max(0, min(255, round(level * channel * intensity)))
+                           for channel in tint)
+            value = bytes((*tinted,
                            alpha if alpha is not None else colors[nearest][3]))
             cache[point] = value
         result.append(cache[point])
     return result
 
 
-def build_replacement(raw, target, mesh, imported_materials=False):
+def build_replacement(raw, target, mesh, imported_materials=False,
+                      vertex_tint=None, color_intensity=1.0):
     layout = read_layout(raw)
     kind, version, flags, flags2, nv, nc, colors, nu, ne, marker = layout.header
     if (nv,nu,ne) != (len(target.vertices),len(target.uvs),len(target.material_ids)):
@@ -380,7 +393,9 @@ def build_replacement(raw, target, mesh, imported_materials=False):
     for v in mesh.vertices+normals: result.extend(struct.pack('<3f',*v))
     if colors:
         original_colors = [raw[layout.color_offset+i*4:layout.color_offset+i*4+4] for i in range(min(nv,nc))]
-        result.extend(b''.join(transfer_colors(target.vertices, mesh.vertices, original_colors))
+        result.extend(b''.join(transfer_colors(
+            target.vertices, mesh.vertices, original_colors,
+            tint=vertex_tint, intensity=color_intensity))
                       if original_colors else b'\xff' * (len(mesh.vertices)*4))
     for uv in mesh.uvs: result.extend(struct.pack('<2f',*uv))
     for mat,count in elements: result.extend(struct.pack('<Ii',count,mat))

@@ -31,6 +31,8 @@ if OpenGLFrame is not None:
             self.texture_ids = {}
             self.material_textures = {}
             self.material_colors = {}
+            self.vertex_tint = (1.0, 1.0, 1.0)
+            self.vertex_color_intensity = 1.0
             self.yaw = -0.55
             self.pitch = 0.20
             self.distance = 3.2
@@ -97,6 +99,12 @@ if OpenGLFrame is not None:
             if self.winfo_ismapped():
                 self._display()
 
+        def set_vertex_tint(self, tint, intensity=1.0):
+            self.vertex_tint = tuple(max(0.0, min(1.0, float(value))) for value in tint)
+            self.vertex_color_intensity = max(0.0, min(2.0, float(intensity)))
+            if self.winfo_ismapped():
+                self._display()
+
         def _release_textures(self):
             if not self.texture_ids or GL is None or not self.winfo_ismapped():
                 self.texture_ids.clear()
@@ -126,7 +134,8 @@ if OpenGLFrame is not None:
             self.texture_ids[key] = tex_id
             return tex_id
 
-        def _draw_mesh(self, vertices, faces, uvs, uv_indices, material_ids, normals=None):
+        def _draw_mesh(self, vertices, faces, uvs, uv_indices, material_ids,
+                       normals=None, vertex_colors=None):
             if not vertices or not faces:
                 return
             face_materials = [0] * len(faces)
@@ -142,13 +151,20 @@ if OpenGLFrame is not None:
                 tex_key = self.material_textures.get(mat_id)
                 tex_id = self._upload_texture(tex_key, self.textures.get(tex_key)) if tex_key is not None else None
                 red, green, blue, alpha = self.material_colors.get(mat_id, (0.68, 0.72, 0.80, 1.0))
+                red = min(1.0, red * self.vertex_tint[0] * self.vertex_color_intensity)
+                green = min(1.0, green * self.vertex_tint[1] * self.vertex_color_intensity)
+                blue = min(1.0, blue * self.vertex_tint[2] * self.vertex_color_intensity)
                 if tex_id:
                     GL.glEnable(GL.GL_TEXTURE_2D); GL.glBindTexture(GL.GL_TEXTURE_2D, tex_id)
-                    GL.glColor4f(red, green, blue, alpha)
                 else:
-                    GL.glDisable(GL.GL_TEXTURE_2D); GL.glColor4f(red, green, blue, alpha)
+                    GL.glDisable(GL.GL_TEXTURE_2D)
                 GL.glBegin(GL.GL_TRIANGLES)
                 for corner, vi in enumerate(face):
+                    if vertex_colors and 0 <= vi < len(vertex_colors):
+                        vr, vg, vb, va = vertex_colors[vi]
+                        GL.glColor4f(red * vr, green * vg, blue * vb, alpha * va)
+                    else:
+                        GL.glColor4f(red, green, blue, alpha)
                     if uv_indices and face_index < len(uv_indices) and uvs:
                         ui = uv_indices[face_index][corner]
                         if 0 <= ui < len(uvs):
@@ -175,7 +191,10 @@ if OpenGLFrame is not None:
             if self.mesh:
                 GL.glPushMatrix()
                 GL.glTranslatef(-self.target[0], -self.target[1], -self.target[2])
-                self._draw_mesh(self.mesh.vertices, self.mesh.faces, self.mesh.uvs, self.mesh.uv_indices, self.mesh.material_ids, self.mesh.normals)
+                self._draw_mesh(
+                    self.mesh.vertices, self.mesh.faces, self.mesh.uvs,
+                    self.mesh.uv_indices, self.mesh.material_ids,
+                    self.mesh.normals, self.mesh.vertex_colors)
                 if self.mesh.second_vertices and self.mesh.second_faces:
                     self._draw_mesh(self.mesh.second_vertices, self.mesh.second_faces,
                                     self.mesh.second_uvs or [], self.mesh.second_uv_indices or [],

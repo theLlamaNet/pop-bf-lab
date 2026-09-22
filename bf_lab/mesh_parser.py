@@ -56,7 +56,15 @@ def _scan_pop_meshes(data: bytes) -> list[MeshInfo]:
                 normal_data = r.f32s(3 * num_vertices)
                 normals = list(zip(normal_data[0::3], normal_data[1::3], normal_data[2::3]))
             if has_unknown:
-                r.bytes(min(num_unknown, num_vertices) * 4)
+                color_count = min(num_unknown, num_vertices)
+                color_bytes = r.bytes(color_count * 4)
+                vertex_colors = [tuple(channel / 255.0 for channel in color_bytes[i:i + 4])
+                                 for i in range(0, len(color_bytes), 4)]
+                if color_count < num_vertices:
+                    vertex_colors.extend([(1.0, 1.0, 1.0, 1.0)]
+                                         * (num_vertices - color_count))
+            else:
+                vertex_colors = None
             uv_data = r.f32s(2 * num_uvs)
             uvs = list(zip(uv_data[0::2], uv_data[1::2]))
 
@@ -99,10 +107,68 @@ def _scan_pop_meshes(data: bytes) -> list[MeshInfo]:
                                    second_uvs=second_uvs, second_uv_indices=second_uv_indices,
                                    second_material_ids=second_material_ids, normals=normals,
                                    skin_bones=layout.bones, skin_flags=layout.skin_flags,
-                                   layout_name="Character / skin" if layout.bones else "Static mesh"))
+                                   layout_name="Character / skin" if layout.bones else "Static mesh",
+                                   vertex_colors=vertex_colors))
         except (ValueError, IndexError, struct.error):
             continue
+    _attach_instance_vertex_colors(data, meshes)
     return meshes
+
+
+def _attach_instance_vertex_colors(data: bytes, meshes: list[MeshInfo]) -> None:
+    """Attach primary GAO RLI colours used by the game to preview meshes."""
+    if not meshes:
+        return
+    entries = _parse_pop_file_entries(data)
+    by_key: dict[int, list[MeshInfo]] = {}
+    for mesh in meshes:
+        by_key.setdefault(mesh.key, []).append(mesh)
+    gao_type = struct.unpack("<I", b".gao")[0]
+    assigned: set[int] = set()
+    for entry in entries:
+        if entry.data_type != gao_type:
+            continue
+        raw = data[entry.data_offset:entry.data_offset + entry.size]
+        payload = raw[4:]
+        try:
+            if len(payload) < 16:
+                continue
+            _version, _flags, identity, name_len = struct.unpack_from("<4I", payload)
+            if not identity & 0x4000:
+                continue
+            visual = 16 + name_len + 10 + 68 + (48 if identity & 0x80000 else 24)
+            if visual + 8 > len(payload):
+                continue
+            gro_key = struct.unpack_from("<I", payload, visual)[0]
+            candidates = by_key.get(gro_key, ())
+            for mesh in candidates:
+                identity_key = id(mesh)
+                if identity_key in assigned:
+                    continue
+                marker = b"\xff\xff" + struct.pack("<I", len(mesh.vertices))
+                search_at, search_end = visual, min(visual + 69, len(payload))
+                while search_at < search_end:
+                    pos = payload.find(marker, search_at, search_end)
+                    if pos < 0:
+                        break
+                    start = pos + 6
+                    end = start + len(mesh.vertices) * 4
+                    sample = min(64, len(mesh.vertices))
+                    valid_alphas = (sum(payload[start + i * 4 + 3] in (0xFD, 0xFE, 0xFF)
+                                        for i in range(sample))
+                                    if end <= len(payload) else 0)
+                    if (end + 4 <= len(payload)
+                            and struct.unpack_from("<I", payload, end)[0] == 1
+                            and (not sample or valid_alphas * 10 >= sample * 9)):
+                        mesh.vertex_colors = [
+                            tuple(channel / 255.0 for channel in payload[offset:offset + 4])
+                            for offset in range(start, end, 4)
+                        ]
+                        assigned.add(identity_key)
+                        break
+                    search_at = pos + 1
+        except (IndexError, struct.error):
+            continue
 
 
 def _scan_pop3_direct_mesh(r: _PopReader, entry: PopFileEntry, version: int) -> MeshInfo | None:

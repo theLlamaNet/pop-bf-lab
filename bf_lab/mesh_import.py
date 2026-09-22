@@ -575,7 +575,10 @@ def _rli_cooked_color(color: bytes) -> bytes:
     return bytes((color[2], color[1], color[0], color[3]))
 
 
-def _mesh_rli_replacements(data: bytes, target: MeshInfo, mesh: MeshInfo) -> dict[int, bytes]:
+def _mesh_rli_replacements(
+        data: bytes, target: MeshInfo, mesh: MeshInfo,
+        vertex_tint: tuple[float, float, float] | None = None,
+        color_intensity: float = 1.0) -> dict[int, bytes]:
     """Rebuild Jade-internal and Direct3D-cooked instance lighting tables."""
     entries = _parse_pop_file_entries(data)
     expanded = list(dict.fromkeys(pair for f, uv in zip(mesh.faces, mesh.uv_indices) for pair in zip(f, uv)))
@@ -653,7 +656,8 @@ def _mesh_rli_replacements(data: bytes, target: MeshInfo, mesh: MeshInfo) -> dic
         # RGB interpolation carries room casts onto edited geometry.  Transfer
         # only scalar luminance and force Jade's RLI validity byte.
         new_colors = jade_mesh.transfer_colors(
-            target.vertices, mesh.vertices, colors, alpha=0xFE)
+            target.vertices, mesh.vertices, colors, alpha=0xFE,
+            tint=vertex_tint, intensity=color_intensity)
         # The expanded table is already GPU-friendly.  GX8BuildUVs.c applies
         # Gx8_M_ConvertColor (R/B swap) while building this representation.
         # Retail T2T data confirms this distinction; writing primary RGBA here
@@ -677,11 +681,17 @@ def _mesh_rli_replacements(data: bytes, target: MeshInfo, mesh: MeshInfo) -> dic
     return updates
 
 
-def _build_static_mesh_replacement(data: bytes, target: MeshInfo, mesh: MeshInfo, imported_materials=False) -> bytes:
+def _build_static_mesh_replacement(
+        data: bytes, target: MeshInfo, mesh: MeshInfo,
+        imported_materials=False,
+        vertex_tint: tuple[float, float, float] | None = None,
+        color_intensity: float = 1.0) -> bytes:
     """Compatibility entry point; now handles static and skinned retail GEO."""
     entry = _parse_pop_file_entries(data)[target.entry_index]
     if entry.key != target.key:
         raise ValueError("Source mesh has changed: rescan the asset.")
     raw = data[entry.data_offset:entry.data_offset + entry.size]
     candidate = replace(mesh, normals=mesh.normals or _mesh_vertex_normals(mesh.vertices, mesh.faces))
-    return jade_mesh.build_replacement(raw, target, candidate, imported_materials)
+    return jade_mesh.build_replacement(
+        raw, target, candidate, imported_materials,
+        vertex_tint, color_intensity)
