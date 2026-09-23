@@ -21,13 +21,14 @@ from ..mesh_import import (
     _build_static_mesh_replacement,
     _load_mesh_for_swap,
     _align_mesh_materials_to_target,
+    _adapt_mesh_skin_to_target,
     _mesh_rli_replacements,
 )
 from ..mesh_uv import _jade_uv_to_standard
 from ..mesh_material_import import import_mesh_materials
 from ..material_stream import insert_material_resources, validate_material_resources
 from ..mesh_collision import recalculate_mesh_collision, insert_collision_resources
-from ..mesh_export import _mesh_obj_lines
+from ..mesh_export import _mesh_obj_lines, _write_skinned_glb, _character_bone_metadata
 from ..mesh_parser import _scan_pop_meshes
 from ..models import (
     Asset,
@@ -158,11 +159,13 @@ class MeshEditorMixin:
         options = ttk.Frame(self.mesh_tab)
         options.pack(fill="x", pady=(0, 6))
         self._mesh_import_materials = tk.BooleanVar(value=False)
+        self._mesh_maintain_original_skin = tk.BooleanVar(value=True)
+        self._mesh_adapt_bones_and_weights = tk.BooleanVar(value=False)
         self._mesh_fit_target = tk.BooleanVar(value=False)
         self._mesh_recalculate_collision = tk.BooleanVar(value=False)
         option_box = ttk.LabelFrame(options, text="Import options", padding=3)
         option_box.pack(side="left")
-        self.mesh_options_tree = ttk.Treeview(option_box, show="tree", height=3, selectmode="browse")
+        self.mesh_options_tree = ttk.Treeview(option_box, show="tree", height=5, selectmode="browse")
         self.mesh_options_tree.column("#0", width=370, stretch=False)
         self.mesh_options_tree.pack(side="left", fill="both")
         option_scroll = ttk.Scrollbar(option_box, orient="vertical", command=self.mesh_options_tree.yview)
@@ -170,11 +173,13 @@ class MeshEditorMixin:
         self.mesh_options_tree.configure(yscrollcommand=option_scroll.set)
         self._mesh_option_rows = {
             "materials": (self._mesh_import_materials, "Import and replace materials"),
+            "skin": (self._mesh_maintain_original_skin, "Mantain original skeleton and weights"),
+            "adapt_skin": (self._mesh_adapt_bones_and_weights, "Adapt bones and weights"),
             "fit": (self._mesh_fit_target, "Fit size and center to the original mesh"),
             "collision": (self._mesh_recalculate_collision, "Recalculate imported mesh collision"),
         }
         for iid, (variable, label) in self._mesh_option_rows.items():
-            self.mesh_options_tree.insert("", "end", iid=iid, text="\u2610 " + label)
+            self.mesh_options_tree.insert("", "end", iid=iid, text=("\u2611 " if variable.get() else "\u2610 ") + label)
         self.mesh_options_tree.bind("<Button-1>", self._toggle_mesh_option)
         self.mesh_options_tree.bind("<space>", self._toggle_mesh_option)
         self.mesh_options_tree.bind("<Return>", self._toggle_mesh_option)
@@ -318,7 +323,7 @@ class MeshEditorMixin:
             self.mesh_canvas.bind("<Configure>", lambda _e: self._schedule_mesh_render())
             self.swap_mesh_canvas = tk.Label(replacement_box, text="OpenGL unavailable", anchor="center")
             self.swap_mesh_canvas.pack(fill="both", expand=True)
-        self.swap_mesh_info = ttk.Label(replacement_box, text="Import a GLB or OBJ. BF rig and weights are transferred automatically for characters.", justify="left", wraplength=750)
+        self.swap_mesh_info = ttk.Label(replacement_box, text="Import a GLB or OBJ. Character GLB files can supply their own skin when the skeleton option is off.", justify="left", wraplength=750)
         self.swap_mesh_info.pack(anchor="w", pady=(6, 0))
         replacement_box.bind("<Configure>", lambda e: self.swap_mesh_info.configure(wraplength=max(250, e.width - 24)))
 
@@ -334,6 +339,11 @@ class MeshEditorMixin:
             return
         variable, label = self._mesh_option_rows[iid]
         variable.set(not variable.get())
+        if variable.get() and iid in ("skin", "adapt_skin"):
+            other = "adapt_skin" if iid == "skin" else "skin"
+            other_variable, other_label = self._mesh_option_rows[other]
+            other_variable.set(False)
+            self.mesh_options_tree.item(other, text="\u2610 " + other_label)
         self.mesh_options_tree.item(iid, text=("\u2611 " if variable.get() else "\u2610 ") + label)
         self.mesh_options_tree.focus(iid)
         self.mesh_options_tree.selection_set(iid)
@@ -593,7 +603,7 @@ class MeshEditorMixin:
                 f"{mesh.layout_name}; {len(mesh.source_joint_names)} source joints. "
                 "Enable 'Import and replace materials' to replace the selected mesh's existing material slots. "
                 "Extra imported slots are not added; when disabled, or when the import has no textures, the mesh retains its BF materials. "
-                "BF character: original rig with weights recalculated by proximity. Static meshes retain local baked-light levels; use Vertex color and Color intensity to tint them manually. Export in the rest pose."
+                "For characters, the skeleton option selects BF weight transfer or the imported GLB skin. Adapt bones and weights maps GLB weights by bone slot to the target BF bone names and bind matrices. Export in the rest pose."
             ))
             self._log(f"OK    Mesh replacement import: {path.name} -> {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
         except Exception as exc:
@@ -636,12 +646,17 @@ class MeshEditorMixin:
                 candidate, target,
                 prefer_native_slots=("OBJ" in self._swap_mesh.layout_name
                                      or materials_replaced))
+            adapt_skin = (self._mesh_adapt_bones_and_weights.get()
+                          and not self._mesh_maintain_original_skin.get())
+            if adapt_skin:
+                candidate = _adapt_mesh_skin_to_target(
+                    candidate, target, _character_bone_metadata(data, target, require_names=True))
             vertex_tint, color_intensity = self._mesh_vertex_color_settings()
             updates.update(_mesh_rli_replacements(
                 data, target, candidate, vertex_tint, color_intensity))
             replacement = _build_static_mesh_replacement(
                 data, target, candidate, materials_replaced,
-                vertex_tint, color_intensity)
+                vertex_tint, color_intensity, self._mesh_maintain_original_skin.get())
             updates[entry.index] = replacement
             collision_additions = []
             if self._mesh_recalculate_collision.get():
@@ -691,7 +706,7 @@ class MeshEditorMixin:
             self.status.set("Mesh applied in memory. Save the BF/BIN/DEC to write it to disk.")
             self.mesh_source_label.config(text=f"{asset.name} - meshes applied in memory, ready to save")
             self._log(f"APPLY Mesh 0x{target.key:08X}: {len(updated.vertices)} vertices, {len(updated.faces)} faces; "
-                      f"{len(updated.skin_bones or [])} BF bones retained, weights transferred automatically; "
+                      f"{len(updated.skin_bones or [])} bones, skin source: {'BF target' if self._mesh_maintain_original_skin.get() else 'adapted imported GLB' if adapt_skin else 'imported GLB'}; "
                       f"vertex color {self._mesh_vertex_color.get().upper()} at {color_intensity * 100:.0f}%")
             return True
         except Exception as exc:
@@ -952,8 +967,16 @@ class MeshEditorMixin:
                 texture.save(tex_path, "PNG")
                 textures_out[texture_key] = tex_path
 
-            mtl_lines = [f"# Exported by PoP BF Lab", f"# Mesh 0x{mesh.key:08X}"]
             texture_map = self._mesh_material_textures_by_mesh.get(mesh.key, {})
+            if mesh.skin_bones:
+                glb_path = base.with_suffix(".glb")
+                _write_skinned_glb(mesh, glb_path, textures_out, texture_map,
+                                   _character_bone_metadata(self._mesh_data, mesh))
+                self._log(f"OK    Character mesh export: {glb_path}")
+                messagebox.showinfo("Export mesh", f"Created in the source folder:\n{glb_path}\n{len(textures_out)} PNG textures")
+                return
+
+            mtl_lines = [f"# Exported by PoP BF Lab", f"# Mesh 0x{mesh.key:08X}"]
             for mat_id, _count in mesh.material_ids:
                 tex_key = texture_map.get(mat_id)
                 mtl_lines.append(f"newmtl mat_{mat_id}")

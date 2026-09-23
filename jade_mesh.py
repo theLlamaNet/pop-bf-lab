@@ -344,7 +344,8 @@ def transfer_colors(old_vertices, new_vertices, colors, alpha=None,
 
 
 def build_replacement(raw, target, mesh, imported_materials=False,
-                      vertex_tint=None, color_intensity=1.0):
+                      vertex_tint=None, color_intensity=1.0,
+                      maintain_original_skin=True):
     layout = read_layout(raw)
     kind, version, flags, flags2, nv, nc, colors, nu, ne, marker = layout.header
     if (nv,nu,ne) != (len(target.vertices),len(target.uvs),len(target.material_ids)):
@@ -384,11 +385,21 @@ def build_replacement(raw, target, mesh, imported_materials=False,
     bones=layout.bones
     if cooked and cooked['magic']==3 and not bones:
         raise ValueError('Skinned buffer has no bone assignments.')
-    if bones:
+    if bones and not maintain_original_skin:
+        if not mesh.skin_bones:
+            raise ValueError('Import a skinned GLB with JOINTS and WEIGHTS to use its original skeleton and weights.')
+        target_slots = {bone.index for bone in bones}
+        source_slots = {bone.index for bone in mesh.skin_bones}
+        if source_slots != target_slots:
+            raise ValueError('Imported skeleton uses different GAO bone slots. This BF object cannot use it without replacing its GAO bone links and animation hierarchy.')
+        bones=mesh.skin_bones
+        if any(b.index*3>65535 for b in bones):
+            raise ValueError('Imported bone index exceeds the cooked skin buffer range.')
+    elif bones:
         bones=transfer_skin(bones,target.vertices,mesh.vertices,3 if cooked and cooked['magic']==3 else None)
     result=bytearray(struct.pack('<10I',kind,version,flags,flags2,len(mesh.vertices),
                     len(mesh.vertices) if colors else 0,colors,len(mesh.uvs),ne,marker))
-    if marker==0xC0DE2002: result.extend(pack_skin(layout.skin_flags,bones))
+    if marker==0xC0DE2002: result.extend(pack_skin(layout.skin_flags if maintain_original_skin else mesh.skin_flags,bones))
     result.extend(struct.pack('<I',1))
     for v in mesh.vertices+normals: result.extend(struct.pack('<3f',*v))
     if colors:
@@ -442,6 +453,6 @@ def build_replacement(raw, target, mesh, imported_materials=False,
     rebuilt=bytes(result)
     checked=read_layout(rebuilt)
     read_cooked(rebuilt,checked,elements,len(mesh.faces))
-    if [(b.index,b.matrix,b.matrix_type) for b in checked.bones] != [(b.index,b.matrix,b.matrix_type) for b in layout.bones]:
+    if [(b.index,b.matrix,b.matrix_type) for b in checked.bones] != [(b.index,b.matrix,b.matrix_type) for b in bones]:
         raise ValueError('Skin matrix verification failed.')
     return rebuilt

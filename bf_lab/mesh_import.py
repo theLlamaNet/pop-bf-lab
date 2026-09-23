@@ -135,6 +135,10 @@ def _glb_mat_mul(left: tuple[float, ...], right: tuple[float, ...]) -> tuple[flo
                  for column in range(4) for row in range(4))
 
 
+_JADE_TO_GLTF = (1., 0., 0., 0., 0., 0., -1., 0., 0., 1., 0., 0., 0., 0., 0., 1.)
+_GLTF_TO_JADE = (1., 0., 0., 0., 0., 0., 1., 0., 0., -1., 0., 0., 0., 0., 0., 1.)
+
+
 def _glb_node_matrix(node: dict) -> tuple[float, ...]:
     """Return a validated local glTF transform, baking TRS when needed."""
     matrix = node.get("matrix")
@@ -191,7 +195,7 @@ def _glb_transform_normal(matrix: tuple[float, ...], normal: tuple[float, float,
 
 
 def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], dict[int, int], dict[int, tuple[float, float, float, float]]]:
-    """Import rest geometry to Jade axes; detect rigs for rebinding to the BF skin."""
+    """Import rest geometry and native skin influences in Jade coordinates."""
     document, buffers = _read_glb_for_mesh_swap(path)
     source_joint_names = []
     meshes = document.get("meshes", [])
@@ -233,7 +237,7 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
                 raise ValueError("GLB node has an invalid mesh reference.")
             if "weights" in node:
                 raise ValueError("GLB morph targets are not supported: export the rest pose.")
-            instances.append((mesh_index, world, str(node.get("name") or meshes[mesh_index].get("name") or f"mesh_{mesh_index}"), joint_names))
+            instances.append((mesh_index, world, str(node.get("name") or meshes[mesh_index].get("name") or f"mesh_{mesh_index}"), joint_names, node.get("skin")))
         for child in node.get("children", []):
             visit(child, world, ancestry | {index})
 
@@ -252,7 +256,7 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
                 raise ValueError("GLB scene has an invalid root node.")
             visit(root, identity, set())
     else:
-        instances = [(index, identity, str(mesh.get("name") or f"mesh_{index}"), ())
+        instances = [(index, identity, str(mesh.get("name") or f"mesh_{index}"), (), None)
                      for index, mesh in enumerate(meshes) if isinstance(mesh, dict)]
     if not instances:
         raise ValueError("The GLB contains no mesh instances in the active scene.")
@@ -268,8 +272,10 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
     preview_images: dict[int, object] = {}
     material_textures: dict[int, int] = {}
     material_colors: dict[int, tuple[float, float, float, float]] = {}
+    imported_bones: dict[int, jade_mesh.SkinBone] = {}
+    imported_skin_flags: int | None = None
 
-    for mesh_index, transform, instance_name, joint_names in instances:
+    for mesh_index, transform, instance_name, joint_names, skin_index in instances:
         mesh_document = meshes[mesh_index]
         if not isinstance(mesh_document, dict) or not isinstance(mesh_document.get("primitives"), list):
             raise ValueError("GLB mesh has no valid primitives.")
@@ -317,6 +323,7 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
             triangles = [triangle for triangle in triangles if len(set(triangle)) == 3]
             if not triangles:
                 continue
+            vertex_start, uv_start = len(vertices), len(uvs)
             if joint_names:
                 if "JOINTS_0" not in attrs or "WEIGHTS_0" not in attrs:
                     raise ValueError("Skinned mesh has no JOINTS_0/WEIGHTS_0 attributes.")
@@ -332,7 +339,47 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
                         raise ValueError("GLB joint indices are out of range.")
                     if any(len(ws) != 4 or any(not math.isfinite(w) or w < 0 for w in ws) for ws in wvalues):
                         raise ValueError("Invalid GLB weights.")
-            vertex_start, uv_start = len(vertices), len(uvs)
+                skin = document["skins"][skin_index]
+                flags = skin.get("extras", {}).get("jade_skin_flags", 0)
+                if not isinstance(flags, int) or not 0 <= flags <= 65535:
+                    raise ValueError("Invalid Jade skin flags.")
+                if imported_skin_flags is not None and imported_skin_flags != flags:
+                    raise ValueError("A GLB with multiple incompatible skins cannot be merged.")
+                imported_skin_flags = flags
+                ibms = (_glb_accessor_values(document, buffers, skin["inverseBindMatrices"])
+                        if isinstance(skin.get("inverseBindMatrices"), int) else [])
+                if ibms and len(ibms) != len(joint_names):
+                    raise ValueError("Inverse bind matrix count differs from the skin joint count.")
+                for ordinal, node_index in enumerate(skin["joints"]):
+                    extra = nodes[node_index].get("extras", {})
+                    index = extra.get("bone_idx", ordinal)
+                    if not isinstance(index, int) or not 0 <= index <= 65535:
+                        raise ValueError("Invalid Jade bone index.")
+                    matrix_type = extra.get("matrix_type", 0)
+                    if not isinstance(matrix_type, int):
+                        raise ValueError("Invalid Jade matrix type.")
+                    if "bind_matrix" in extra:
+                        matrix = extra["bind_matrix"]
+                    elif ibms:
+                        matrix = _glb_mat_mul(_glb_mat_mul(_GLTF_TO_JADE, ibms[ordinal]), _JADE_TO_GLTF)
+                    else:
+                        raise ValueError("The imported skin needs inverse bind matrices.")
+                    if len(matrix) != 16 or not all(math.isfinite(float(x)) for x in matrix):
+                        raise ValueError("Invalid skin bind matrix.")
+                    existing = imported_bones.get(index)
+                    if existing is None:
+                        imported_bones[index] = jade_mesh.SkinBone(index, tuple(float(x) for x in matrix), matrix_type, [])
+                    elif existing.matrix != tuple(float(x) for x in matrix):
+                        raise ValueError("Conflicting bind matrices for one Jade bone.")
+                for suffix in sorted(key[7:] for key in attrs if key.startswith("JOINTS_")):
+                    jvalues = _glb_accessor_values(document, buffers, attrs["JOINTS_" + suffix])
+                    wvalues = _glb_accessor_values(document, buffers, attrs["WEIGHTS_" + suffix])
+                    for local_index, (joints, weights) in enumerate(zip(jvalues, wvalues)):
+                        for joint, weight in zip(joints, weights):
+                            if weight > 0:
+                                bone_index = skin["joints"][int(joint)]
+                                native_index = nodes[bone_index].get("extras", {}).get("bone_idx", int(joint))
+                                imported_bones[native_index].weights.append((vertex_start + local_index, jade_mesh.encode_weight(weight)))
             converted_positions = []
             for position in positions:
                 x, y, z = _glb_transform_point(transform, position)
@@ -370,10 +417,12 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
                         material_textures[material_id] = texture_key
     if not faces:
         raise ValueError("The GLB contains no importable triangles.")
-    label = ", ".join(dict.fromkeys(name for _, _, name, _ in instances))
+    label = ", ".join(dict.fromkeys(name for _, _, name, _, _ in instances))
     mesh = MeshInfo(0, 0, -1, 0, vertices, faces, uvs, uv_indices, material_ids,
                     object_name=label or path.stem, normals=normals,
                     source_joint_names=tuple(dict.fromkeys(source_joint_names)),
+                    skin_bones=list(imported_bones.values()) or None,
+                    skin_flags=imported_skin_flags or 0,
                     layout_name="Character GLB" if source_joint_names else "Static mesh GLB")
     return mesh, preview_images, material_textures, material_colors
 
@@ -555,6 +604,65 @@ def _load_mesh_for_swap(path: Path, obj_axes: str = "Jade Z-up"):
     raise ValueError("Unsupported mesh format: choose .glb or .obj.")
 
 
+def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
+                               target_bone_metadata: dict[int, tuple[str, int | None, int]]) -> MeshInfo:
+    """Keep matching slots, pair remaining slots, and discard surplus bones."""
+    source_bones = mesh.skin_bones or []
+    target_bones = target.skin_bones or []
+    if not source_bones:
+        raise ValueError("Adapt bones and weights requires a skinned GLB with JOINTS and WEIGHTS.")
+    if not target_bones:
+        raise ValueError("The selected BF mesh has no character skeleton to adapt to.")
+    source_by_slot = {bone.index: bone for bone in source_bones}
+    if len(source_by_slot) != len(source_bones):
+        raise ValueError("Imported GLB has duplicate bone slots.")
+    target_by_slot = {bone.index: bone for bone in target_bones}
+    if len(target_by_slot) != len(target_bones):
+        raise ValueError("BF target has duplicate bone slots.")
+    pairs = [(source_by_slot[bone.index], bone)
+             for bone in target_bones if bone.index in source_by_slot]
+    paired_source = {source.index for source, _ in pairs}
+    paired_target = {bone.index for _, bone in pairs}
+    pairs.extend(zip((bone for bone in source_bones if bone.index not in paired_source),
+                     (bone for bone in target_bones if bone.index not in paired_target)))
+    if any(target_bone.index not in target_bone_metadata for _, target_bone in pairs):
+        raise ValueError("Cannot resolve the matched target bone names from the BF GAO gizmo table.")
+    weights_by_slot = {bone.index: {} for bone in target_bones}
+    for source_bone, target_bone in pairs:
+        weights = weights_by_slot[target_bone.index]
+        for vertex, word in source_bone.weights:
+            if not 0 <= vertex < len(mesh.vertices):
+                raise ValueError("Imported skin weight refers to an invalid vertex.")
+            weights[vertex] = weights.get(vertex, 0.0) + jade_mesh.decode_weight(word)
+    totals = [0.0] * len(mesh.vertices)
+    for weights in weights_by_slot.values():
+        for vertex, weight in weights.items():
+            totals[vertex] += weight
+    uncovered = {vertex for vertex, total in enumerate(totals) if total <= 0}
+    if uncovered:
+        # Dropping surplus joints can leave a vertex with no influence. Use
+        # the target's existing paint only for those vertices.
+        fallback = jade_mesh.transfer_skin(target_bones, target.vertices, mesh.vertices)
+        for bone in fallback:
+            weights = weights_by_slot[bone.index]
+            for vertex, word in bone.weights:
+                if vertex in uncovered:
+                    weights[vertex] = jade_mesh.decode_weight(word)
+        for weights in weights_by_slot.values():
+            for vertex, weight in weights.items():
+                if vertex in uncovered:
+                    totals[vertex] += weight
+    if any(total <= 0 for total in totals):
+        raise ValueError("Some imported vertices have no usable skin weights.")
+    adapted = [replace(bone, weights=[(vertex, jade_mesh.encode_weight(weight / totals[vertex]))
+                                       for vertex, weight in sorted(weights_by_slot[bone.index].items())
+                                       if weight > 0]) for bone in target_bones]
+    names = tuple(target_bone_metadata.get(bone.index, (f"bone_{bone.index}", None, 0))[0]
+                  for bone in target_bones)
+    return replace(mesh, skin_bones=adapted, skin_flags=target.skin_flags,
+                   source_joint_names=names)
+
+
 def _mesh_vertex_normals(vertices, faces):
     normals = [[0.0, 0.0, 0.0] for _ in vertices]
     for a, b, c in faces:
@@ -685,7 +793,8 @@ def _build_static_mesh_replacement(
         data: bytes, target: MeshInfo, mesh: MeshInfo,
         imported_materials=False,
         vertex_tint: tuple[float, float, float] | None = None,
-        color_intensity: float = 1.0) -> bytes:
+        color_intensity: float = 1.0,
+        maintain_original_skin: bool = True) -> bytes:
     """Compatibility entry point; now handles static and skinned retail GEO."""
     entry = _parse_pop_file_entries(data)[target.entry_index]
     if entry.key != target.key:
@@ -694,4 +803,4 @@ def _build_static_mesh_replacement(
     candidate = replace(mesh, normals=mesh.normals or _mesh_vertex_normals(mesh.vertices, mesh.faces))
     return jade_mesh.build_replacement(
         raw, target, candidate, imported_materials,
-        vertex_tint, color_intensity)
+        vertex_tint, color_intensity, maintain_original_skin)
