@@ -47,9 +47,21 @@ def import_mesh_materials(data, target, mesh, images, texture_map, colors, updat
     if not usable_slots:
         raise ValueError("Cannot replace materials: no editable native material slot was found.")
 
+    textured_sources = list(dict.fromkeys(
+        slot for slot, _ in groups if texture_map.get(slot) in images))
+    if len(textured_sources) > len({original[slot] for slot in usable_slots}):
+        raise ValueError(
+            "Cannot replace all materials: the imported mesh uses more textured materials "
+            "than the target has distinct editable native materials. Choose a target with "
+            "more material slots or combine imported materials first.")
+
     used_keys, additions = set(by_key), []
     texture_cache, texture_is_opaque = {}, {}
-    texture_donor = max(textures, key=lambda texture: texture.data_end - texture.data_offset)
+    dxt5_donors = [texture for texture in textures if texture.texture_type == 7
+                   and texture.format == "DXT5"]
+    if not dxt5_donors:
+        raise ValueError("Cannot replace materials: this asset has no native DXT5 texture template.")
+    texture_donor = dxt5_donors[0]
 
     def add_texture(raw):
         key = 0x7A000000 | (uuid.uuid4().int & 0xFFFFFF)
@@ -83,8 +95,28 @@ def import_mesh_materials(data, target, mesh, images, texture_map, colors, updat
             from PIL import Image
             image = image.resize((width, height), Image.Resampling.LANCZOS)
         header = bytearray(data[texture_donor.offset:texture_donor.offset + 56])
-        struct.pack_into("<4I", header, 40, 7, width, height, 0)
-        texture_cache[cache_key] = add_texture(header + _encode_dxt5(image, 1))
+        # Jade stores dimensions twice: the 16-bit surface size at +12 and
+        # the 32-bit pixel size at +44. Leaving the donor surface size here
+        # makes the game allocate/decode a different surface from the payload.
+        struct.pack_into("<hh", header, 12, width, height)
+        # Native Jade DXT5 records keep levels down to 8x8 (or 4x4 for
+        # smaller surfaces); +52 stores the number of extra mip levels.
+        mip_count = max(1, max(width, height).bit_length() - 3)
+        struct.pack_into("<4I", header, 40, 7, width, height, mip_count - 1)
+        # Retail rectangular surfaces carry extra small mip levels until the
+        # compressed pixel stream reaches a 64-byte boundary. These bytes are
+        # image blocks, not zero padding.
+        pixel_mip_count = mip_count
+        while pixel_mip_count < 16:
+            level_sizes = [(max(1, width >> level), max(1, height >> level))
+                           for level in range(pixel_mip_count)]
+            byte_count = sum(max(1, (w + 3) // 4) * max(1, (h + 3) // 4) * 16
+                             for w, h in level_sizes)
+            if byte_count % 64 == 0:
+                break
+            pixel_mip_count += 1
+        pixels = _encode_dxt5(image, pixel_mip_count)
+        texture_cache[cache_key] = add_texture(header + pixels)
         texture_is_opaque[cache_key] = image.getextrema()[3][0] == 255
         return texture_cache[cache_key], texture_is_opaque[cache_key]
 
@@ -98,6 +130,7 @@ def import_mesh_materials(data, target, mesh, images, texture_map, colors, updat
     fallback_slots = [slot for slot in usable_slots if slot not in direct_slots]
     fallback_slots.extend(slot for slot in usable_slots if slot in direct_slots)
     fallback_by_source = {}
+    assigned_textures = {}
     updates, result_groups = dict(updates), []
     for position, (source_slot, count) in enumerate(groups):
         # PoP BF Lab OBJ exports name materials mat_N.  Blender can reorder
@@ -115,6 +148,12 @@ def import_mesh_materials(data, target, mesh, images, texture_map, colors, updat
         result_groups.append((native_slot, count))
         if image_key not in images:
             continue
+        previous_image = assigned_textures.get(native_key)
+        if previous_image is not None and previous_image != image_key:
+            raise ValueError(
+                f"Cannot replace all materials: native material 0x{native_key:08X} "
+                "is shared by different imported textures.")
+        assigned_textures[native_key] = image_key
         entry = by_key[native_key]
         raw = bytearray(data[entry.data_offset:entry.data_offset + entry.size])
         texture_key, opaque = texture_for(image_key, colors.get(source_slot, (1., 1., 1., 1.)))

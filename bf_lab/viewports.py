@@ -110,6 +110,7 @@ if OpenGLFrame is not None:
                 self.texture_ids.clear()
                 return
             try:
+                self.tkMakeCurrent()
                 GL.glDeleteTextures(list(self.texture_ids.values()))
             except Exception:
                 pass

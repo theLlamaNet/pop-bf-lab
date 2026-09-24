@@ -105,11 +105,26 @@ def validate_material_resources(data, keys):
             full = max(resources, key=lambda entry: entry.size)
             full_raw = data[full.data_offset:full.data_offset+full.size]
             fmt, width, height = struct.unpack_from('<III', full_raw, 40)
-            blocks = max(1, (width + 3) // 4) * max(1, (height + 3) // 4)
-            expected = {5: blocks * 8, 6: blocks * 16, 7: blocks * 16}.get(fmt)
-            if expected is not None and full.size - header_size != expected:
-                raise ValueError(
-                    f'Texture 0x{key:08X} payload does not match its format/dimensions.')
+            bytes_per_block = {5: 8, 6: 16, 7: 16}.get(fmt)
+            expected = None
+            if bytes_per_block is not None:
+                mip_count = struct.unpack_from('<I', full_raw, 52)[0] + 1
+                if not 1 <= mip_count <= 16:
+                    raise ValueError(f'Texture 0x{key:08X} has an invalid mip count.')
+                expected = 0
+                level_width, level_height = width, height
+                for _ in range(mip_count):
+                    expected += max(1, (level_width + 3) // 4) * max(1, (level_height + 3) // 4) * bytes_per_block
+                    level_width, level_height = max(1, level_width // 2), max(1, level_height // 2)
+            if expected is not None:
+                from .textures import _infer_mip_count
+                try:
+                    actual_mips = _infer_mip_count(width, height, full.size - header_size, bytes_per_block)
+                except ValueError as exc:
+                    raise ValueError(
+                        f'Texture 0x{key:08X} payload does not match its format/dimensions.') from exc
+                if actual_mips < mip_count:
+                    raise ValueError(f'Texture 0x{key:08X} has fewer pixel levels than its header.')
 
 
 def repair_legacy_material_tail(data):

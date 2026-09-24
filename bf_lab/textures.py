@@ -32,6 +32,10 @@ def _scan_pop_textures(data: bytes) -> list[TextureInfo]:
             data_offset -= 2
         if texture_type == 1:
             data_offset += 4
+        elif texture_type == 5 and version >= 3:
+            # Retail BC1 records have a four-byte field between the 56-byte
+            # header and pixel data. Demo version-1 records start at +56.
+            data_offset += 4
         elif texture_type == 11 and version >= 4:
             data_offset += 8
         data_end = entry.data_offset + entry.size
