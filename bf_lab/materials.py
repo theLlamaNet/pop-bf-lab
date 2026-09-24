@@ -186,6 +186,17 @@ def _scan_pop_material_records(data: bytes, valid_texture_keys: set[int] | None 
             else:
                 texture_offset = entry.data_offset + 4 + r.pos
                 texture_key = r.u32()
+                if version == 6 and valid_texture_keys and texture_key not in valid_texture_keys:
+                    # Sands of Time demo materials can place extra fields before
+                    # the diffuse texture key. Match Blender's aligned search,
+                    # and retain the actual offset for material replacement.
+                    for offset in range(r.pos, len(r.data) - 3, 4):
+                        candidate = struct.unpack_from("<I", r.data, offset)[0]
+                        if candidate in valid_texture_keys:
+                            texture_key = candidate
+                            texture_offset = entry.data_offset + 4 + offset
+                            r.pos = offset + 4
+                            break
             secondary_key = None
             if valid_texture_keys and texture_offset is not None:
                 # The Blender POP reader intentionally stopped after the base

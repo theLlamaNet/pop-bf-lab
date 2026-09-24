@@ -25,7 +25,7 @@ def _scan_pop_textures(data: bytes) -> list[TextureInfo]:
         if texture_type not in (0, 1, 5, 6, 7, 11) or not (1 <= width <= 8192 and 1 <= height <= 8192):
             continue
         data_offset = entry.data_offset + 56
-        if texture_type in (1, 5):
+        if texture_type == 1:
             data_offset += 4
         elif texture_type == 11 and version >= 4:
             data_offset += 8
