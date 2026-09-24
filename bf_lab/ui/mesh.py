@@ -531,8 +531,8 @@ class MeshEditorMixin:
             f"OK    Mesh texture search: {len(found)} found, {len(remaining)} unresolved"
         )
 
-    def scan_meshes(self) -> None:
-        asset = self._selected_asset()
+    def scan_meshes(self, asset: Asset | None = None, mesh_key: int | None = None) -> None:
+        asset = asset or self._selected_asset()
         if asset is None:
             messagebox.showinfo("Mesh Swap", "Select a .wow/.bin/.gao asset in the browser first.")
             return
@@ -567,9 +567,14 @@ class MeshEditorMixin:
             self._mesh_yaw = -0.45
             self._mesh_pitch = 0.18
             self._mesh_zoom = 1.0
+            if mesh_key is not None and not any(mesh.key == mesh_key for mesh in meshes):
+                raise ValueError(f"Mesh 0x{mesh_key:08X} was not found in {asset.name}.")
             if meshes:
-                self.mesh_tree.selection_set("mesh_0")
-                self.mesh_tree.focus("mesh_0")
+                selected_index = next((i for i, mesh in enumerate(meshes) if mesh.key == mesh_key), 0)
+                iid = f"mesh_{selected_index}"
+                self.mesh_tree.selection_set(iid)
+                self.mesh_tree.focus(iid)
+                self.mesh_tree.see(iid)
                 self.on_mesh_selected()
             self.status.set("Ready")
             self._log(f"OK    Mesh scan: {asset.name} -> {len(meshes)} meshes, {len(images)} material textures resolved")

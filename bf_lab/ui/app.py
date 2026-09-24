@@ -19,12 +19,13 @@ from ..project import JadeProject
 from .assets import AssetBrowserMixin
 from .material import MaterialEditorMixin
 from .mesh import MeshEditorMixin
+from .level import LevelEditorMixin
 from .ova import OvaEditorMixin
 from .repack import RepackMixin
 from .texture import TextureEditorMixin
 
 
-class JadeToolkit(AssetBrowserMixin, RepackMixin, OvaEditorMixin, MeshEditorMixin, MaterialEditorMixin, TextureEditorMixin, tk.Tk):
+class JadeToolkit(AssetBrowserMixin, RepackMixin, OvaEditorMixin, LevelEditorMixin, MeshEditorMixin, MaterialEditorMixin, TextureEditorMixin, tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("PoP BF Lab")
@@ -258,13 +259,6 @@ class JadeToolkit(AssetBrowserMixin, RepackMixin, OvaEditorMixin, MeshEditorMixi
 
         self.status = tk.StringVar(value="Ready")
         ttk.Label(root, textvariable=self.status, relief="sunken", anchor="w").pack(fill="x", pady=(8, 0))
-
-    def _build_level_tab(self) -> None:
-        self._placeholder(self.level_tab, "Level Editor", "Prepared for .wow/.gao level data", [
-            "• BF indexing and targeted extraction are already available in the Asset Browser.",
-            "• GameObject/material/mesh structures are taken from the local Blender Addon.",
-            "• This panel will provide access to transforms, groups, portals and triggers.",
-        ])
 
     def _placeholder(self, parent, title: str, subtitle: str, lines: list[str]) -> None:
         ttk.Label(parent, text=title, font=("TkDefaultFont", 14, "bold")).pack(anchor="w")

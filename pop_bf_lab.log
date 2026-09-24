@@ -1,1 +1,29 @@
 INFO  PoP BF Lab ready — integrated BF + POP-LZO + OVA core.
+INFO  Opening BF import dialog...
+INFO  Parsing BF: C:/Users/Admin/Desktop/Prince of Persia Tools/BigFiles/T2T_FULL_GAME_windows.bf
+INFO  BF opened: v38, 6,648 indexed entries, FAT=1
+INFO  Opening BF import dialog...
+INFO  Parsing BF: C:/Users/Admin/Desktop/Prince of Persia Tools/BigFiles/SOT_FULL_GAME_windows.bf
+INFO  BF opened: v37, 3,308 indexed entries, FAT=1
+OK    Level workspace: menu3D_wol_ff000ce0.bin — 84 objects, 11 meshes
+Unable to import OpenGL.arrays.numpymodule.NumpyHandler: No numpy module present: No module named 'numpy'
+OK    Level workspace: menu3D_wow_ff000cb9.bin — 109 objects, 45 meshes
+OK    Level textures: 0 external textures found, 1 unresolved
+APPLY Level: 1 object transforms staged
+OK    .BF saved: C:/Program Files (x86)/Ubisoft/Prince of Persia - The Sands of Time/prince.bf • modified entries: #257
+APPLY Level: 2 object transforms staged
+OK    .BF saved: C:/Program Files (x86)/Ubisoft/Prince of Persia - The Sands of Time/prince.bf • modified entries: #257
+INFO  Opening BF import dialog...
+INFO  Parsing BF: C:/Program Files (x86)/Ubisoft/Prince of Persia - The Sands of Time/prince.bf
+INFO  BF opened: v37, 3,308 indexed entries, FAT=1
+OK    Level workspace: 0101_Entree_wow_ff02b4f9.bin — 518 objects, 214 meshes
+APPLY Level: 1 object transforms staged
+OK    .BF saved: C:/Program Files (x86)/Ubisoft/Prince of Persia - The Sands of Time/prince.bf • modified entries: #13
+OK    Level workspace: menu3D_wow_ff000cb9.bin — 109 objects, 45 meshes
+INFO  Opening BF import dialog...
+INFO  Parsing BF: C:/Users/Admin/Desktop/Prince of Persia Tools/BigFiles/SOT_FULL_GAME_windows.bf
+INFO  BF opened: v37, 3,308 indexed entries, FAT=1
+OK    Level workspace: 0101_Entree_wow_ff02b4f9.bin — 518 objects, 214 meshes
+OK    Level workspace: 0101_Entree_wow_ff02b4f9.bin — 518 objects, 214 meshes
+APPLY Level: 8 object transforms staged
+OK    .BF saved: C:/Program Files (x86)/Ubisoft/Prince of Persia - The Sands of Time/prince.bf • modified entries: #13

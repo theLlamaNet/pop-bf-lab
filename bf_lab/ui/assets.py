@@ -156,6 +156,7 @@ class AssetBrowserMixin:
                                                                   "POP-LZO" if asset.compressed else "none", f"0x{asset.key:08X}"))
             count += 1
         self.asset_count.config(text=f"{count:,} assets")
+        self.refresh_levels()
 
     def _selected_asset(self) -> Optional[Asset]:
         selection = self.asset_tree.selection()
