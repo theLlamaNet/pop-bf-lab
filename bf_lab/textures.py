@@ -25,6 +25,11 @@ def _scan_pop_textures(data: bytes) -> list[TextureInfo]:
         if texture_type not in (0, 1, 5, 6, 7, 11) or not (1 <= width <= 8192 and 1 <= height <= 8192):
             continue
         data_offset = entry.data_offset + 56
+        # Demo type-0 entries with version 0x20000 have a 54-byte header.
+        # Their final two bytes at +54 are already the first image pixel;
+        # skipping 56 bytes makes a 32x32 BGRA surface appear 2 bytes short.
+        if texture_type == 0 and version == 0x20000:
+            data_offset -= 2
         if texture_type == 1:
             data_offset += 4
         elif texture_type == 11 and version >= 4:

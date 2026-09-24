@@ -55,8 +55,8 @@ def scan_level_objects(data: bytes, source_asset_index: int = 0) -> list[LevelOb
             if identity & 0x4000 and visual_at + 8 <= len(payload):
                 mesh_key, material_key = struct.unpack_from("<II", payload, visual_at)
             lower = name.casefold()
-            kind = ("trigger" if any(s in lower for s in ("trigger", "trig", "volume", "portal"))
-                    else "light" if any(s in lower for s in ("light", "lamp", "lum_"))
+            kind = ("trigger" if any(s in lower for s in ("trigger", "trig", "volume", "portal", "tec", "ini_pos"))
+                    else "light" if any(s in lower for s in ("light", "lamp", "lum_", "lanterne"))
                     else "mesh" if mesh_key is not None else "object")
             objects.append(LevelObject(entry.key, entry.index, name or f"Object 0x{entry.key:08X}",
                                        mesh_key, material_key, entry.data_offset + 4 + matrix,

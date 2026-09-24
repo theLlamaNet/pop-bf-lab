@@ -68,6 +68,41 @@ def ray_triangle(origin, direction, a, b, c):
     return distance if distance > 0.01 else None
 
 
+BOX_FACES = ((0, 1, 3, 2), (0, 4, 5, 1), (4, 6, 7, 5),
+             (6, 7, 3, 2), (0, 2, 6, 4), (1, 3, 7, 5))
+BOX_EDGES = tuple((i, i | bit) for i in range(8) for bit in (1, 2, 4) if not i & bit)
+
+
+def volume_corners(obj):
+    """The same local bounding-box geometry used by the Blender importer."""
+    bounds = obj.bounds
+    if len(bounds) != 6 or not all(math.isfinite(v) and abs(v) < 100000 for v in bounds):
+        return None
+    xmin, ymin, zmin, xmax, ymax, zmax = bounds
+    if xmin >= xmax or ymin >= ymax or zmin >= zmax:
+        return None
+    return list(transformed_vertices(((x, y, z) for x in (xmin, xmax)
+                                      for y in (ymin, ymax) for z in (zmin, zmax)), obj))
+
+
+def ray_volume(origin, direction, corners):
+    distances = (ray_triangle(origin, direction, corners[face[0]],
+                              corners[face[i]], corners[face[i + 1]])
+                 for face in BOX_FACES for i in (1, 2))
+    return min((distance for distance in distances if distance is not None), default=None)
+
+
+def volume_color(name):
+    lower = name.casefold()
+    if "portal" in lower:
+        return (0.12, 0.85, 0.28)
+    if "ini_pos" in lower or "set position" in lower:
+        return (0.22, 0.4, 1.0)
+    if "loading" in lower:
+        return (1.0, 0.55, 0.12)
+    return (0.08, 0.78, 0.95)
+
+
 if OpenGLFrame is not None:
     class LevelViewport(MeshViewport):
         def __init__(self, master, owner, **kwargs):
@@ -234,6 +269,19 @@ if OpenGLFrame is not None:
             direction = tuple(v / length for v in direction)
             closest = (float("inf"), None)
             for obj in self.objects:
+                linked = self.mesh_links.get(id(obj), ())
+                if obj.kind == "light" and self.show_markers:
+                    screen = self._screen_point(obj.position)
+                    if screen is not None and math.hypot(x - screen[0], y - screen[1]) <= 14:
+                        depth = math.dist(eye, obj.position)
+                        if depth < closest[0]:
+                            closest = (depth, obj)
+                elif self.show_markers and (obj.kind == "trigger" or not linked):
+                    corners = volume_corners(obj)
+                    if corners:
+                        distance = ray_volume(eye, direction, corners)
+                        if distance is not None and distance < closest[0]:
+                            closest = (distance, obj)
                 for key in self.mesh_links.get(id(obj), ()):
                     mesh = self.meshes.get(key)
                     if mesh is None:
@@ -253,34 +301,63 @@ if OpenGLFrame is not None:
 
         def _draw_marker(self, obj):
             x, y, z = obj.position
-            size = max(0.3, self.distance * 0.008)
             GL.glDisable(GL.GL_TEXTURE_2D)
             GL.glDisable(GL.GL_LIGHTING)
-            color = ((1.0, 0.65, 0.15) if obj.kind == "light" else
-                     (0.95, 0.2, 0.75) if obj.kind == "trigger" else (0.5, 0.8, 1.0))
-            GL.glColor3f(*color)
-            GL.glBegin(GL.GL_LINES)
-            for axis in range(3):
-                a = [x, y, z]; b = [x, y, z]
-                a[axis] -= size; b[axis] += size
-                GL.glVertex3f(*a); GL.glVertex3f(*b)
-            if obj.kind == "trigger" and all(math.isfinite(v) for v in obj.bounds):
-                xmin, ymin, zmin, xmax, ymax, zmax = obj.bounds
-                if all(abs(v) < 100000 for v in obj.bounds):
-                    bx, by, bz = object_basis(obj)
-                    corners = []
-                    for lx in (xmin, xmax):
-                        for ly in (ymin, ymax):
-                            for lz in (zmin, zmax):
-                                lx1, ly1, lz1 = lx * obj.scale[0], ly * obj.scale[1], lz * obj.scale[2]
-                                corners.append((x + lx1 * bx[0] + ly1 * by[0] + lz1 * bz[0],
-                                                y + lx1 * bx[1] + ly1 * by[1] + lz1 * bz[1],
-                                                z + lx1 * bx[2] + ly1 * by[2] + lz1 * bz[2]))
-                    for i in range(8):
-                        for bit in (1, 2, 4):
-                            if not i & bit:
-                                GL.glVertex3f(*corners[i]); GL.glVertex3f(*corners[i | bit])
-            GL.glEnd()
+            if obj.kind == "light":
+                # Camera-facing bulb icon, kept at a readable screen size.
+                _eye, _outward, right, up = self._camera_frame()
+                size = max(0.3, self.distance * 0.012)
+                def point(a, b):
+                    return (x + size * (a * right[0] + b * up[0]),
+                            y + size * (a * right[1] + b * up[1]),
+                            z + size * (a * right[2] + b * up[2]))
+                GL.glDisable(GL.GL_DEPTH_TEST)
+                GL.glColor3f(1.0, 0.85, 0.12)
+                GL.glLineWidth(2.5 if obj is self.selected else 1.8)
+                GL.glBegin(GL.GL_LINE_STRIP)
+                for a, b in ((-.45, .1), (-.55, .42), (-.4, .75), (0, .9),
+                             (.4, .75), (.55, .42), (.45, .1), (.25, -.12),
+                             (.25, -.35), (-.25, -.35), (-.25, -.12), (-.45, .1)):
+                    GL.glVertex3f(*point(a, b))
+                GL.glEnd()
+                GL.glBegin(GL.GL_LINES)
+                for a, b, c, d in ((-.23, -.48, .23, -.48), (-.15, -.62, .15, -.62),
+                                   (0, 1.1, 0, 1.35), (-.85, .7, -1.05, .85),
+                                   (.85, .7, 1.05, .85)):
+                    GL.glVertex3f(*point(a, b)); GL.glVertex3f(*point(c, d))
+                GL.glEnd()
+                GL.glEnable(GL.GL_DEPTH_TEST)
+            else:
+                corners = volume_corners(obj)
+                if corners:
+                    color = volume_color(obj.name)
+                    GL.glEnable(GL.GL_BLEND)
+                    GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+                    GL.glDepthMask(GL.GL_FALSE)
+                    GL.glColor4f(*color, 0.18)
+                    GL.glBegin(GL.GL_QUADS)
+                    for face in BOX_FACES:
+                        for index in face:
+                            GL.glVertex3f(*corners[index])
+                    GL.glEnd()
+                    GL.glDepthMask(GL.GL_TRUE)
+                    GL.glDisable(GL.GL_BLEND)
+                    GL.glColor3f(*(1.0, 0.58, 0.12) if obj is self.selected else color)
+                    GL.glLineWidth(2.5 if obj is self.selected else 1.5)
+                    GL.glBegin(GL.GL_LINES)
+                    for a, b in BOX_EDGES:
+                        GL.glVertex3f(*corners[a]); GL.glVertex3f(*corners[b])
+                    GL.glEnd()
+                else:
+                    size = max(0.3, self.distance * 0.008)
+                    GL.glColor3f(0.5, 0.8, 1.0)
+                    GL.glBegin(GL.GL_LINES)
+                    for axis in range(3):
+                        a = [x, y, z]; b = [x, y, z]
+                        a[axis] -= size; b[axis] += size
+                        GL.glVertex3f(*a); GL.glVertex3f(*b)
+                    GL.glEnd()
+            GL.glLineWidth(1.0)
             GL.glEnable(GL.GL_LIGHTING)
 
         def _draw_selection(self, obj, linked):
@@ -441,7 +518,7 @@ if OpenGLFrame is not None:
                 GL.glCallList(self._display_lists[id(obj)][1])
                 if obj is self.selected:
                     self._draw_selection(obj, linked)
-                if obj is self.selected and self.show_markers:
+                if self.show_markers and (obj.kind in ("light", "trigger") or obj is self.selected):
                     self._draw_marker(obj)
             GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_FILL)
             GL.glDisable(GL.GL_TEXTURE_2D)
@@ -504,7 +581,7 @@ class LevelWorkspace(tk.Toplevel):
         self.flashlight_button.pack(side="left", padx=(8, 2))
         display_row = ttk.Frame(modes)
         display_row.pack(anchor="w", pady=(5, 0))
-        self.markers_button = ttk.Button(display_row, text="Reticle stars: On", command=self.toggle_markers)
+        self.markers_button = ttk.Button(display_row, text="Lights & Triggers: On", command=self.toggle_markers)
         self.markers_button.pack(side="left", padx=2)
         self.wireframe_button = ttk.Button(display_row, text="Wireframe: Off", command=self.toggle_wireframe)
         self.wireframe_button.pack(side="left", padx=2)
@@ -565,7 +642,7 @@ class LevelWorkspace(tk.Toplevel):
                 field.bind("<Return>", self._commit_fields)
                 field.bind("<FocusOut>", self._commit_fields)
                 self.fields[(group, axis)] = var
-        ttk.Label(inspector, text="Click a mesh to select it; drag a colored gizmo handle to transform it.\nDouble-click an object to focus and orbit it.\nW/S: forward/back  •  A/D: strafe\nArrows: move up/down/left/right\nLeft drag: orbit  •  Right drag: pan  •  Wheel: zoom", wraplength=230).pack(anchor="w", pady=12)
+        ttk.Label(inspector, text="Click a mesh, trigger, or light to select it; drag a colored gizmo handle to transform it.\nDouble-click an object to focus and orbit it.\nW/S: forward/back  •  A/D: strafe\nArrows: move up/down/left/right\nLeft drag: orbit  •  Right drag: pan  •  Wheel: zoom", wraplength=230).pack(anchor="w", pady=12)
 
     def toggle_flashlight(self):
         if self.viewport is None:
@@ -578,7 +655,7 @@ class LevelWorkspace(tk.Toplevel):
         if self.viewport is None:
             return
         self.viewport.show_markers = not self.viewport.show_markers
-        self.markers_button.config(text=f"Reticle stars: {'On' if self.viewport.show_markers else 'Off'}")
+        self.markers_button.config(text=f"Lights & Triggers: {'On' if self.viewport.show_markers else 'Off'}")
         self.viewport._display()
 
     def toggle_wireframe(self):
