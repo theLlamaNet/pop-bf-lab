@@ -1,6 +1,7 @@
 """Mesh Editor controls, preview and import/export actions."""
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import colorsys
@@ -15,6 +16,7 @@ from ..materials import (
     _associate_mesh_material_packs,
     _jade_color_rgba,
     _scan_pop_material_records,
+    _scan_pop_material_import_records,
     _scan_pop_materials,
 )
 from ..mesh_import import (
@@ -607,7 +609,7 @@ class MeshEditorMixin:
                 f"{len(material_colors)} materials - {len(textures)} textures\n"
                 f"{mesh.layout_name}; {len(mesh.source_joint_names)} source joints. "
                 "Enable 'Import and replace materials' to replace the selected mesh's existing material slots. "
-                "Extra imported slots are not added; when disabled, or when the import has no textures, the mesh retains its BF materials. "
+                "When imported materials exceed BF slots, choose whether to add them. "
                 "For characters, the skeleton option selects BF weight transfer or the imported GLB skin. Adapt bones and weights maps GLB weights by bone slot to the target BF bone names and bind matrices. Export in the rest pose."
             ))
             self._log(f"OK    Mesh replacement import: {path.name} -> {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
@@ -641,14 +643,36 @@ class MeshEditorMixin:
             updates = {}
             additions = []
             materials_replaced = False
+            add_excess = False
             if self._mesh_import_materials.get():
                 before_material_import = candidate
+                packs, _ = _scan_pop_materials(data)
+                native_keys = packs.get(target.material_pack_key, [])
+                texture_keys = {texture.key for texture in _scan_pop_textures(data)}
+                editable = _scan_pop_material_import_records(data, texture_keys)
+                if not native_keys and target.material_pack_key in editable:
+                    native_keys = [target.material_pack_key]
+                native_count = len(native_keys)
+                editable_count = len({key for key in native_keys
+                                      if key in editable and editable[key].texture_offset is not None})
+                source_count = len({slot for slot, count in candidate.material_ids if count > 0})
+                add_excess = (source_count > editable_count and messagebox.askyesno(
+                    "Add excess materials",
+                    f"The imported mesh has {source_count} materials; this BF pack has "
+                    f"{native_count} slots ({editable_count} editable).\n\n"
+                    "Add excess materials?",
+                    parent=self))
                 candidate, updates, additions = import_mesh_materials(
                     data, target, candidate, self._swap_mesh_textures,
-                    self._swap_mesh_material_textures, self._swap_mesh_material_colors, updates)
+                    self._swap_mesh_material_textures, self._swap_mesh_material_colors, updates,
+                    add_excess=add_excess)
                 materials_replaced = candidate is not before_material_import
+            alignment_target = target
+            if add_excess:
+                slots = list(dict.fromkeys(slot for slot, _ in candidate.material_ids))
+                alignment_target = replace(target, material_ids=[(slot, 0) for slot in slots])
             candidate = _align_mesh_materials_to_target(
-                candidate, target,
+                candidate, alignment_target,
                 prefer_native_slots=("OBJ" in self._swap_mesh.layout_name
                                      or materials_replaced))
             adapt_skin = (self._mesh_adapt_bones_and_weights.get()

@@ -154,6 +154,7 @@ class MeshSkinRoundtripTests(unittest.TestCase):
         source.skin_bones.append(jade_mesh.SkinBone(
             8, IDENTITY, 0, [(1, jade_mesh.encode_weight(1.)),
                              (2, jade_mesh.encode_weight(1.))]))
+        source.source_bone_names = {7: 'Prince_Arm', 8: 'Prince_Leg'}
         adapted = _adapt_mesh_skin_to_target(source, target, {
             1: ('Prince_Arm', None, 0x10), 3: ('Prince_Leg', 1, 0x20)})
         self.assertEqual([bone.index for bone in adapted.skin_bones], [1, 3])
@@ -169,7 +170,9 @@ class MeshSkinRoundtripTests(unittest.TestCase):
     def test_adapt_keeps_unmatched_target_slots_without_weights(self):
         target = sample_mesh(1)
         target.skin_bones.append(jade_mesh.SkinBone(3, IDENTITY, 0, []))
-        adapted = _adapt_mesh_skin_to_target(sample_mesh(7), target, {
+        source = sample_mesh(7)
+        source.source_bone_names = {7: 'Arm'}
+        adapted = _adapt_mesh_skin_to_target(source, target, {
             1: ('Arm', None, 0x10)})
         self.assertEqual([bone.index for bone in adapted.skin_bones], [1, 3])
         self.assertEqual(len(adapted.skin_bones[0].weights), 3)
@@ -183,6 +186,7 @@ class MeshSkinRoundtripTests(unittest.TestCase):
         source.skin_bones.extend([
             jade_mesh.SkinBone(8, IDENTITY, 0, [(1, jade_mesh.encode_weight(1.))]),
             jade_mesh.SkinBone(9, IDENTITY, 0, [(2, jade_mesh.encode_weight(1.))])])
+        source.source_bone_names = {7: 'Arm', 8: 'Leg', 9: 'Unused'}
         adapted = _adapt_mesh_skin_to_target(source, target, {
             1: ('Arm', None, 0x10), 3: ('Leg', None, 0x20)})
         self.assertEqual([bone.index for bone in adapted.skin_bones], [1, 3])
@@ -227,6 +231,26 @@ class MeshSkinRoundtripTests(unittest.TestCase):
             1: ('Arm', None, 0x10), 3: ('Leg', None, 0x20)})
         self.assertEqual(adapted.skin_bones[0].weights[0], source.skin_bones[1].weights[0])
         self.assertEqual(adapted.skin_bones[1].weights, source.skin_bones[0].weights)
+
+    def test_adapt_rejects_unmatched_joint_order(self):
+        target = sample_mesh(1)
+        target.skin_bones.append(jade_mesh.SkinBone(3, IDENTITY, 0, []))
+        source = sample_mesh(7)
+        source.source_bone_names = {7: 'Other'}
+        with self.assertRaisesRegex(ValueError, 'No imported joints match'):
+            _adapt_mesh_skin_to_target(source, target, {
+                1: ('Arm', None, 0x10), 3: ('Leg', None, 0x20)})
+
+    def test_export_fills_unpainted_retail_vertex(self):
+        mesh = sample_mesh(1)
+        mesh.skin_bones[0].weights = [(0, jade_mesh.encode_weight(1.)),
+                                      (1, jade_mesh.encode_weight(1.))]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'partial.glb'
+            _write_skinned_glb(mesh, path)
+            imported, *_ = _load_glb_mesh_for_swap(path)
+        self.assertEqual({vertex for bone in imported.skin_bones for vertex, _ in bone.weights},
+                         {0, 1, 2})
 
 
 if __name__ == '__main__':

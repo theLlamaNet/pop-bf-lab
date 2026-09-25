@@ -86,6 +86,8 @@ class MeshInfo:
     skin_bones: list[jade_mesh.SkinBone] | None = None
     skin_flags: int = 0
     source_joint_names: tuple[str, ...] = ()
+    source_bone_names: dict[int, str] | None = None
+    source_bone_keys: dict[int, int] | None = None
     layout_name: str = ""
     vertex_colors: list[tuple[float, float, float, float]] | None = None
 

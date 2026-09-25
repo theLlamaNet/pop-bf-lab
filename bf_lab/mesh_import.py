@@ -273,6 +273,8 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
     material_textures: dict[int, int] = {}
     material_colors: dict[int, tuple[float, float, float, float]] = {}
     imported_bones: dict[int, jade_mesh.SkinBone] = {}
+    imported_bone_names: dict[int, str] = {}
+    imported_bone_keys: dict[int, int] = {}
     imported_skin_flags: int | None = None
 
     for mesh_index, transform, instance_name, joint_names, skin_index in instances:
@@ -367,6 +369,13 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
                     if len(matrix) != 16 or not all(math.isfinite(float(x)) for x in matrix):
                         raise ValueError("Invalid skin bind matrix.")
                     existing = imported_bones.get(index)
+                    imported_bone_names[index] = joint_names[ordinal]
+                    jade_key = extra.get("jade_key")
+                    if isinstance(jade_key, str):
+                        try:
+                            imported_bone_keys[index] = int(jade_key, 0)
+                        except ValueError:
+                            pass
                     if existing is None:
                         imported_bones[index] = jade_mesh.SkinBone(index, tuple(float(x) for x in matrix), matrix_type, [])
                     elif existing.matrix != tuple(float(x) for x in matrix):
@@ -421,6 +430,8 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
     mesh = MeshInfo(0, 0, -1, 0, vertices, faces, uvs, uv_indices, material_ids,
                     object_name=label or path.stem, normals=normals,
                     source_joint_names=tuple(dict.fromkeys(source_joint_names)),
+                    source_bone_names=imported_bone_names,
+                    source_bone_keys=imported_bone_keys,
                     skin_bones=list(imported_bones.values()) or None,
                     skin_flags=imported_skin_flags or 0,
                     layout_name="Character GLB" if source_joint_names else "Static mesh GLB")
@@ -606,7 +617,7 @@ def _load_mesh_for_swap(path: Path, obj_axes: str = "Jade Z-up"):
 
 def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
                                target_bone_metadata: dict[int, tuple[str, int | None, int]]) -> MeshInfo:
-    """Keep matching slots, pair remaining slots, and discard surplus bones."""
+    """Map source joints to the animated target by key or name, never by order."""
     source_bones = mesh.skin_bones or []
     target_bones = target.skin_bones or []
     if not source_bones:
@@ -619,13 +630,45 @@ def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
     target_by_slot = {bone.index: bone for bone in target_bones}
     if len(target_by_slot) != len(target_bones):
         raise ValueError("BF target has duplicate bone slots.")
-    pairs = [(source_by_slot[bone.index], bone)
-             for bone in target_bones if bone.index in source_by_slot]
-    paired_source = {source.index for source, _ in pairs}
-    paired_target = {bone.index for _, bone in pairs}
-    pairs.extend(zip((bone for bone in source_bones if bone.index not in paired_source),
-                     (bone for bone in target_bones if bone.index not in paired_target)))
-    if any(target_bone.index not in target_bone_metadata for _, target_bone in pairs):
+    target_by_key = {info[2]: target_by_slot[index] for index, info in target_bone_metadata.items()
+                     if index in target_by_slot and info[2] is not None}
+    target_by_name = {}
+    for index, info in target_bone_metadata.items():
+        if index in target_by_slot:
+            target_by_name.setdefault(info[0].casefold(), []).append(target_by_slot[index])
+    pairs, claimed = [], set()
+    for source in source_bones:
+        target_bone = target_by_key.get((mesh.source_bone_keys or {}).get(source.index))
+        if target_bone is None:
+            name = (mesh.source_bone_names or {}).get(source.index, "").casefold()
+            matches = target_by_name.get(name, []) if name else []
+            if len(matches) == 1:
+                target_bone = matches[0]
+        if target_bone is None and source.index in target_by_slot:
+            # Native slot IDs are useful for files exported from this target;
+            # authoring tools may renumber them, so named mismatches are unsafe.
+            name = (mesh.source_bone_names or {}).get(source.index, "")
+            if ((not name and all(abs(a - b) < 1e-5 for a, b in
+                                  zip(source.matrix, target_by_slot[source.index].matrix)))
+                    or name.casefold() == target_bone_metadata.get(source.index, ("",))[0].casefold()):
+                target_bone = target_by_slot[source.index]
+            elif (source.index not in target_bone_metadata and
+                  all(abs(a - b) < 1e-5 for a, b in
+                      zip(source.matrix, target_by_slot[source.index].matrix))):
+                # Some retail meshes have no discoverable GAO gizmo names.
+                # An unchanged native slot with the same bind matrix is safe.
+                target_bone = target_by_slot[source.index]
+        if target_bone is None:
+            continue
+        if target_bone.index in claimed:
+            raise ValueError("Two imported joints map to one target bone; check joint names.")
+        claimed.add(target_bone.index)
+        pairs.append((source, target_bone))
+    if not pairs:
+        raise ValueError("No imported joints match the target GAO bone names or keys.")
+    if any(target_bone.index not in target_bone_metadata and
+           source_bone.matrix != target_bone.matrix
+           for source_bone, target_bone in pairs):
         raise ValueError("Cannot resolve the matched target bone names from the BF GAO gizmo table.")
     weights_by_slot = {bone.index: {} for bone in target_bones}
     for source_bone, target_bone in pairs:
@@ -638,10 +681,23 @@ def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
     for weights in weights_by_slot.values():
         for vertex, weight in weights.items():
             totals[vertex] += weight
-    uncovered = {vertex for vertex, total in enumerate(totals) if total <= 0}
+    source_totals = [0.0] * len(mesh.vertices)
+    for bone in source_bones:
+        for vertex, word in bone.weights:
+            if not 0 <= vertex < len(mesh.vertices):
+                raise ValueError("Imported skin weight refers to an invalid vertex.")
+            source_totals[vertex] += jade_mesh.decode_weight(word)
+    uncovered = {vertex for vertex, total in enumerate(totals)
+                 if total <= 0 or (source_totals[vertex] > 0 and
+                                   total / source_totals[vertex] < 0.5)}
     if uncovered:
-        # Dropping surplus joints can leave a vertex with no influence. Use
-        # the target's existing paint only for those vertices.
+        # A small surviving influence must not be inflated to full weight
+        # after a dominant unmatched joint is dropped.
+        for weights in weights_by_slot.values():
+            for vertex in uncovered:
+                weights.pop(vertex, None)
+        for vertex in uncovered:
+            totals[vertex] = 0.0
         fallback = jade_mesh.transfer_skin(target_bones, target.vertices, mesh.vertices)
         for bone in fallback:
             weights = weights_by_slot[bone.index]

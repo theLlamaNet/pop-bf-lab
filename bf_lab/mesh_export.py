@@ -137,8 +137,17 @@ def _write_skinned_glb(mesh, path, texture_paths=None, material_textures=None,
             weight = jade_mesh.decode_weight(word)
             if weight:
                 influences[vertex].append((ordinal, weight))
-    if any(not row for row in influences):
-        raise ValueError("A character vertex has no skin weights.")
+    # Retail GEO files can contain unpainted vertices (often unused helper
+    # points). glTF still needs a valid skin at each exported vertex.
+    weighted = [index for index, row in enumerate(influences) if row]
+    if not weighted:
+        raise ValueError("The character has no usable skin weights.")
+    if len(weighted) != len(influences):
+        nearest = jade_mesh.NearestPoints(mesh.vertices, weighted)
+        for index, row in enumerate(influences):
+            if not row:
+                donor = nearest.nearest(mesh.vertices[index], 1)[0][1]
+                influences[index] = list(influences[donor])
 
     blob = bytearray()
     doc = {"asset": {"version": "2.0", "generator": "PoP BF Lab"},
