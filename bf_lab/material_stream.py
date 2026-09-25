@@ -38,6 +38,9 @@ def insert_material_resources(data, additions):
     fulls = [e for e, raw in textures if e not in descriptors]
     if not fulls:
         raise ValueError('No native full texture loading phase found for imported materials.')
+    from .materials import _scan_pop_materials
+    material_packs, _ = _scan_pop_materials(body)
+    by_key = {entry.key: entry for entry in entries}
     packs, leaves, headers, pixels = [], [], [], []
     for key, magic, raw in pending:
         raw = bytes(raw)
@@ -51,13 +54,25 @@ def insert_material_resources(data, additions):
         elif struct.unpack_from('<I', raw)[0] == 4:
             packs.append(record(raw))
         elif struct.unpack_from('<I', raw)[0] == 5:
-            leaves.append(record(raw))
+            parents = [slots for slots in material_packs.values() if key in slots]
+            anchor = None
+            if parents:
+                siblings = [by_key[slot] for slots in parents for slot in slots
+                            if slot in by_key and by_key[slot].data_type == 5]
+                if siblings:
+                    anchor = max(sibling.data_offset + sibling.size for sibling in siblings)
+                    if anchor > material_at:
+                        raise ValueError(
+                            f'Cannot add material 0x{key:08X}: its pack follows the texture load phase.')
+            leaves.append((anchor, key, record(raw)))
         else:
             raise ValueError('Unsupported imported material dependency.')
     def wave_offset(wave, key):
         following = next((entry for entry in wave if entry.key > key), None)
         return following.offset if following else wave[-1].data_offset + wave[-1].size
-    inserts = {material_at: [(0, blob) for blob in packs+leaves]}
+    inserts = {material_at: [(0, blob) for blob in packs]}
+    for anchor, key, blob in leaves:
+        inserts.setdefault(anchor if anchor is not None else material_at, []).append((key, blob))
     for wave, records in ((descriptors, headers), (fulls, pixels)):
         for key, blob in records:
             inserts.setdefault(wave_offset(wave, key), []).append((key, blob))
@@ -80,6 +95,16 @@ def validate_material_resources(data, keys):
         by_key.setdefault(entry.key, []).append(entry)
     from .materials import _scan_pop_materials
     packs, leaves = _scan_pop_materials(data)
+    for pack_key, slots in packs.items():
+        if not any(slot in keys for slot in slots):
+            continue
+        pack_entries = by_key.get(pack_key, [])
+        if not pack_entries:
+            raise ValueError(f'Missing parent material pack 0x{pack_key:08X}.')
+        pack_offset = pack_entries[0].offset
+        for slot in slots:
+            if slot not in by_key or by_key[slot][0].offset <= pack_offset:
+                raise ValueError(f'Invalid Jade pack reference: 0x{pack_key:08X} -> 0x{slot:08X}.')
     two_pass = any(is_texture(data[e.data_offset:e.data_offset+e.size]) and
                    e.size <= texture_header_size(data[e.data_offset:e.data_offset+e.size])+4
                    for e in entries)

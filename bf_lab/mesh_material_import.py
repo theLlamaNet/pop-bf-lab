@@ -8,6 +8,19 @@ from .resources import _parse_pop_file_entries
 from .textures import _scan_pop_textures, _encode_dxt5
 
 
+def material_source_aliases(mesh, texture_map, colors):
+    """Treat duplicated GLB materials with the same image/factor as one slot."""
+    by_appearance = {}
+    aliases = {}
+    for source, count in mesh.material_ids:
+        if count <= 0 or source in aliases:
+            continue
+        appearance = (texture_map.get(source),
+                      tuple(colors.get(source, (1., 1., 1., 1.))))
+        aliases[source] = by_appearance.setdefault(appearance, source)
+    return aliases
+
+
 def _set_material_alpha_mode(raw: bytearray, alpha_mode: str) -> None:
     version = struct.unpack_from("<I", raw, 4)[0]
     if not 4 <= version <= 9:
@@ -19,6 +32,7 @@ def _set_material_alpha_mode(raw: bytearray, alpha_mode: str) -> None:
     flags = struct.unpack_from("<I", raw, flags_offset)[0]
     flags &= ~((0xF << 16) | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 9) | (1 << 10))
     if alpha_mode == "cutout":
+        flags &= ~(0x3F << 24)
         flags |= 1 << 4
     elif alpha_mode == "blend":
         flags |= 1 << 16
@@ -45,7 +59,8 @@ def import_mesh_materials(data, target, mesh, images, texture_map, colors, updat
 
     if not target.material_ids:
         raise ValueError("Cannot replace materials: the selected mesh has no material elements.")
-    groups = list(mesh.material_ids)
+    aliases = material_source_aliases(mesh, texture_map, colors)
+    groups = [(aliases.get(slot, slot), count) for slot, count in mesh.material_ids]
 
     native_slots = []
     for slot, _ in target.material_ids:
@@ -95,8 +110,11 @@ def import_mesh_materials(data, target, mesh, images, texture_map, colors, updat
                 [round(value * max(0., min(1., factor[index]))) for value in range(256)])
                 for index, channel in enumerate(image.split())))
         source_alpha = image.getchannel("A").histogram()
+        # Jade's character materials normally use alpha test. PNGs exported
+        # from BF often contain broad intermediate alpha values; blending all
+        # of them makes the whole character translucent in the game.
         alpha_mode = ("opaque" if sum(source_alpha[:255]) == 0 else
-                      "cutout" if sum(source_alpha[1:255]) == 0 else "blend")
+                      "blend" if factor[3] < 0.98 else "cutout")
         # baseColorFactor alpha multiplies the PNG alpha; an opaque factor
         # must not erase cutouts already present in the image.
         source_w, source_h = image.size
@@ -158,8 +176,8 @@ def import_mesh_materials(data, target, mesh, images, texture_map, colors, updat
                 source_slots[source] = free_slots.pop(0)
         extra_sources = [source for source in sources if source not in source_slots]
         extra_count = len(extra_sources)
-        if len(original) + extra_count > 1000:
-            raise ValueError("The enlarged Jade material pack exceeds 1000 slots.")
+        if len(original) + extra_count > 255:
+            raise ValueError("The Jade engine supports at most 255 slots in a multi-material pack.")
         template_key = original[usable_slots[0]]
         template = by_key[template_key]
         template_record = records[template_key]

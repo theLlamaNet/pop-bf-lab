@@ -241,6 +241,66 @@ class MeshSkinRoundtripTests(unittest.TestCase):
             _adapt_mesh_skin_to_target(source, target, {
                 1: ('Arm', None, 0x10), 3: ('Leg', None, 0x20)})
 
+    def test_adapt_recovers_corrupt_weights_at_original_positions(self):
+        from dataclasses import replace
+        vertices = [(float(index), 0., 0.) for index in range(40)]
+        target = replace(sample_mesh(1), vertices=vertices,
+                         skin_bones=[jade_mesh.SkinBone(1, IDENTITY, 0,
+                             [(index, jade_mesh.encode_weight(1.)) for index in range(40)])])
+        source = replace(target, skin_bones=[jade_mesh.SkinBone(3, IDENTITY, 0,
+                         [(index, jade_mesh.encode_weight(1.)) for index in range(40)])],
+                         source_bone_names={3: 'Wrong'})
+        target.skin_bones.append(jade_mesh.SkinBone(3, IDENTITY, 0, []))
+        adapted = _adapt_mesh_skin_to_target(source, target, {
+            1: ('Right', None, 0x10), 3: ('Wrong', None, 0x20)})
+        self.assertEqual(len(adapted.skin_bones[0].weights), 40)
+        self.assertFalse(adapted.skin_bones[1].weights)
+
+    def test_adapt_collapses_missing_joint_to_matched_parent(self):
+        target = sample_mesh(1)
+        source = sample_mesh(7)
+        source.skin_bones[0].weights = [(0, jade_mesh.encode_weight(1.))]
+        source.skin_bones.append(jade_mesh.SkinBone(8, IDENTITY, 0,
+            [(1, jade_mesh.encode_weight(1.)), (2, jade_mesh.encode_weight(1.))]))
+        source.source_bone_names = {7: 'UpperArm', 8: 'Forearm'}
+        source.source_bone_parents = {8: 7}
+        adapted = _adapt_mesh_skin_to_target(source, target, {
+            1: ('UpperArm', None, 0x10)})
+        self.assertEqual([vertex for vertex, _ in adapted.skin_bones[0].weights], [0, 1, 2])
+
+    def test_adapt_converts_source_rest_pose_to_target_rest_pose(self):
+        target = sample_mesh(1)
+        source = sample_mesh(7)
+        moved = list(IDENTITY)
+        moved[12] = -1.
+        source.skin_bones[0].matrix = tuple(moved)
+        source.vertices = [(x + 1., y, z) for x, y, z in source.vertices]
+        source.source_bone_names = {7: 'Arm'}
+        adapted = _adapt_mesh_skin_to_target(source, target, {
+            1: ('Arm', None, 0x10)})
+        for actual, expected in zip(adapted.vertices, target.vertices):
+            self.assertAlmostEqual(actual[0], expected[0], places=3)
+
+    def test_adapt_removes_only_isolated_extreme_triangles(self):
+        from dataclasses import replace
+        target = sample_mesh(1)
+        source = replace(target,
+                         vertices=target.vertices + [(1000., 0., 0.), (1001., 0., 0.), (1000., 1., 0.)],
+                         faces=target.faces + [(3, 4, 5)],
+                         uv_indices=target.uv_indices + [(0, 1, 2)],
+                         material_ids=[(0, len(target.faces) + 1)],
+                         skin_bones=[jade_mesh.SkinBone(1, IDENTITY, 0,
+                             [(index, jade_mesh.encode_weight(1.)) for index in range(6)])])
+        adapted = _adapt_mesh_skin_to_target(source, target, {
+            1: ('Arm', None, 0x10)})
+        self.assertEqual(len(adapted.vertices), 3)
+        self.assertEqual(len(adapted.faces), len(target.faces))
+        self.assertEqual(adapted.material_ids, [(0, len(target.faces))])
+        connected = replace(source, faces=target.faces + [(0, 4, 5)])
+        with self.assertRaisesRegex(ValueError, 'connected geometry far outside'):
+            _adapt_mesh_skin_to_target(connected, target, {
+                1: ('Arm', None, 0x10)})
+
     def test_export_fills_unpainted_retail_vertex(self):
         mesh = sample_mesh(1)
         mesh.skin_bones[0].weights = [(0, jade_mesh.encode_weight(1.)),

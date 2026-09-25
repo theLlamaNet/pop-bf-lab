@@ -104,16 +104,25 @@ class JadeProject:
         from .material_stream import insert_material_resources, validate_material_resources
         from .mesh_collision import insert_collision_resources
         data = insert_collision_resources(data, collisions)
+        def apply_patches(payload, selected):
+            for key, original, replacement in selected:
+                entries = _parse_pop_file_entries(payload)
+                candidates = [entry for entry in entries if entry.key == key and
+                              payload[entry.data_offset:entry.data_offset+entry.size] in (original, replacement)]
+                if not candidates:
+                    raise ValueError(f"Conflicting editor changes on resource 0x{key:08X}; rescan the asset.")
+                for entry in reversed(candidates):
+                    payload = (payload[:entry.offset] +
+                               struct.pack("<III", len(replacement), entry.magic, key) +
+                               replacement + payload[entry.data_offset+entry.size:])
+            return payload
+
+        added_keys = {key for key, _, _ in additions.values()}
+        data = apply_patches(data, (patch for patch in patches.values()
+                                    if patch[0] not in added_keys))
         data = insert_material_resources(data, list(additions.values()))
-        for index, (key, original, replacement) in patches.items():
-            entries = _parse_pop_file_entries(data)
-            candidates = [entry for entry in entries if entry.key == key and
-                          data[entry.data_offset:entry.data_offset+entry.size] in (original, replacement)]
-            if not candidates:
-                raise ValueError(f"Conflicting editor changes on resource 0x{key:08X}; rescan the asset.")
-            for entry in reversed(candidates):
-                data = (data[:entry.offset] + struct.pack("<III", len(replacement), entry.magic, key)
-                        + replacement + data[entry.data_offset+entry.size:])
+        data = apply_patches(data, (patch for patch in patches.values()
+                                    if patch[0] in added_keys))
         validate_material_resources(data, {key for key, _, _ in additions.values()})
         return data
 

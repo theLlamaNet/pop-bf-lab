@@ -275,7 +275,10 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
     imported_bones: dict[int, jade_mesh.SkinBone] = {}
     imported_bone_names: dict[int, str] = {}
     imported_bone_keys: dict[int, int] = {}
+    imported_bone_parents: dict[int, int] = {}
     imported_skin_flags: int | None = None
+    node_parents = {child: parent for parent, node in enumerate(nodes)
+                    if isinstance(node, dict) for child in node.get("children", [])}
 
     for mesh_index, transform, instance_name, joint_names, skin_index in instances:
         mesh_document = meshes[mesh_index]
@@ -376,6 +379,14 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
                             imported_bone_keys[index] = int(jade_key, 0)
                         except ValueError:
                             pass
+                    parent_node = node_parents.get(node_index)
+                    joint_nodes = set(skin["joints"])
+                    while parent_node is not None and parent_node not in joint_nodes:
+                        parent_node = node_parents.get(parent_node)
+                    if parent_node is not None:
+                        parent_ordinal = skin["joints"].index(parent_node)
+                        parent_extra = nodes[parent_node].get("extras", {})
+                        imported_bone_parents[index] = parent_extra.get("bone_idx", parent_ordinal)
                     if existing is None:
                         imported_bones[index] = jade_mesh.SkinBone(index, tuple(float(x) for x in matrix), matrix_type, [])
                     elif existing.matrix != tuple(float(x) for x in matrix):
@@ -432,6 +443,7 @@ def _load_glb_mesh_for_swap(path: Path) -> tuple[MeshInfo, dict[int, object], di
                     source_joint_names=tuple(dict.fromkeys(source_joint_names)),
                     source_bone_names=imported_bone_names,
                     source_bone_keys=imported_bone_keys,
+                    source_bone_parents=imported_bone_parents,
                     skin_bones=list(imported_bones.values()) or None,
                     skin_flags=imported_skin_flags or 0,
                     layout_name="Character GLB" if source_joint_names else "Static mesh GLB")
@@ -615,9 +627,48 @@ def _load_mesh_for_swap(path: Path, obj_axes: str = "Jade Z-up"):
     raise ValueError("Unsupported mesh format: choose .glb or .obj.")
 
 
+def _discard_remote_skin_triangles(mesh: MeshInfo, target: MeshInfo) -> MeshInfo:
+    """Remove isolated corrupt triangles far outside the target character."""
+    bounds = [(min(v[axis] for v in target.vertices), max(v[axis] for v in target.vertices))
+              for axis in range(3)]
+    extent = max(high - low for low, high in bounds)
+    if extent <= 0:
+        return mesh
+    remote = {index for index, vertex in enumerate(mesh.vertices)
+              if any(value < low - 10 * extent or value > high + 10 * extent
+                     for value, (low, high) in zip(vertex, bounds))}
+    if not remote:
+        return mesh
+    if any(0 < len(remote.intersection(face)) < 3 for face in mesh.faces):
+        raise ValueError("The GLB has connected geometry far outside the target character; correct its rest pose.")
+    keep_faces = [index for index, face in enumerate(mesh.faces) if not remote.intersection(face)]
+    if len(keep_faces) == len(mesh.faces):
+        return mesh
+    if len(mesh.faces) - len(keep_faces) > max(8, len(mesh.faces) // 100):
+        raise ValueError("Too much imported geometry lies far outside the target character.")
+    used = sorted({vertex for index in keep_faces for vertex in mesh.faces[index]})
+    remap = {old: new for new, old in enumerate(used)}
+    counts, start = [], 0
+    kept = set(keep_faces)
+    for material, count in mesh.material_ids:
+        counts.append((material, sum(index in kept for index in range(start, start + count))))
+        start += count
+    return replace(mesh, vertices=[mesh.vertices[index] for index in used],
+                   normals=[mesh.normals[index] for index in used] if mesh.normals else None,
+                   vertex_colors=[mesh.vertex_colors[index] for index in used] if mesh.vertex_colors else None,
+                   faces=[tuple(remap[vertex] for vertex in mesh.faces[index]) for index in keep_faces],
+                   uv_indices=[mesh.uv_indices[index] for index in keep_faces],
+                   material_ids=counts,
+                   skin_bones=[replace(bone, weights=[(remap[index], word) for index, word in bone.weights
+                                                       if index in remap]) for bone in mesh.skin_bones or []])
+
+
 def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
                                target_bone_metadata: dict[int, tuple[str, int | None, int]]) -> MeshInfo:
     """Map source joints to the animated target by key or name, never by order."""
+    original_faces = len(mesh.faces)
+    mesh = _discard_remote_skin_triangles(mesh, target)
+    discarded_faces = original_faces - len(mesh.faces)
     source_bones = mesh.skin_bones or []
     target_bones = target.skin_bones or []
     if not source_bones:
@@ -670,8 +721,60 @@ def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
            source_bone.matrix != target_bone.matrix
            for source_bone, target_bone in pairs):
         raise ValueError("Cannot resolve the matched target bone names from the BF GAO gizmo table.")
+    # Some third-party GLBs carry the original Jade bind matrices and names,
+    # yet JOINTS/WEIGHTS describe different body parts at the same positions.
+    # A large disagreement on coincident vertices is evidence that the GLB
+    # weight table is unusable; recover the original character's weights.
+    if len(pairs) == len(source_bones) and all(
+            max(abs(a - b) for a, b in zip(source.matrix, destination.matrix)) < 1e-4
+            for source, destination in pairs):
+        source_influences = [{} for _ in mesh.vertices]
+        for source, destination in pairs:
+            for vertex, word in source.weights:
+                source_influences[vertex][destination.index] = jade_mesh.decode_weight(word)
+        target_influences = [{} for _ in target.vertices]
+        for bone in target_bones:
+            for vertex, word in bone.weights:
+                target_influences[vertex][bone.index] = jade_mesh.decode_weight(word)
+        tree = jade_mesh.NearestPoints(target.vertices)
+        compared = disagreements = 0
+        for vertex, influences in zip(mesh.vertices, source_influences):
+            if not influences:
+                continue
+            distance, near = tree.nearest(vertex, 1)[0]
+            if distance > 1e-10 or not target_influences[near]:
+                continue
+            compared += 1
+            if (max(influences, key=influences.get)
+                    != max(target_influences[near], key=target_influences[near].get)):
+                disagreements += 1
+        if compared >= 32 and disagreements / compared > 0.6:
+            recovered = jade_mesh.transfer_skin(target_bones, target.vertices,
+                                                mesh.vertices, 3)
+            return replace(mesh, skin_bones=recovered, skin_flags=target.skin_flags,
+                           skin_adaptation_note=(
+                               f"BF weights recovered ({disagreements}/{compared} coincident vertices disagreed)"),
+                           source_joint_names=tuple(target_bone_metadata.get(
+                               bone.index, (f"bone_{bone.index}",))[0]
+                               for bone in target_bones))
+    mapped = {source.index: destination for source, destination in pairs}
+    source_for_pose = {source.index: source for source, _ in pairs}
+    for source in source_bones:
+        if source.index in mapped:
+            continue
+        parent = (mesh.source_bone_parents or {}).get(source.index)
+        seen = {source.index}
+        while parent is not None and parent not in mapped and parent not in seen:
+            seen.add(parent)
+            parent = (mesh.source_bone_parents or {}).get(parent)
+        if parent in mapped:
+            mapped[source.index] = mapped[parent]
+            source_for_pose[source.index] = source_by_slot[parent]
     weights_by_slot = {bone.index: {} for bone in target_bones}
-    for source_bone, target_bone in pairs:
+    for source_bone in source_bones:
+        target_bone = mapped.get(source_bone.index)
+        if target_bone is None:
+            continue
         weights = weights_by_slot[target_bone.index]
         for vertex, word in source_bone.weights:
             if not 0 <= vertex < len(mesh.vertices):
@@ -713,10 +816,46 @@ def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
     adapted = [replace(bone, weights=[(vertex, jade_mesh.encode_weight(weight / totals[vertex]))
                                        for vertex, weight in sorted(weights_by_slot[bone.index].items())
                                        if weight > 0]) for bone in target_bones]
+    rest_pose_converted = any(max(abs(a - b) for a, b in zip(source_for_pose[source.index].matrix,
+                                          mapped[source.index].matrix)) > 1e-4
+           for source in source_bones if source.index in mapped)
+    if rest_pose_converted:
+        # The GLB is in another armature's rest pose. Convert every influence
+        # from its source bind space into the target bind space before writing
+        # the target matrices. Merely changing joint IDs stretches the mesh.
+        from .mesh_export import _inverse_matrix
+        transforms = {source.index: _glb_mat_mul(
+            _inverse_matrix(mapped[source.index].matrix),
+            source_for_pose[source.index].matrix)
+            for source in source_bones if source.index in mapped}
+        coordinates = [[0.0, 0.0, 0.0] for _ in mesh.vertices]
+        pose_totals = [0.0] * len(mesh.vertices)
+        for source in source_bones:
+            matrix = transforms.get(source.index)
+            if matrix is None:
+                continue
+            for vertex, word in source.weights:
+                weight = jade_mesh.decode_weight(word)
+                position = _glb_transform_point(matrix, mesh.vertices[vertex])
+                for axis in range(3):
+                    coordinates[vertex][axis] += weight * position[axis]
+                pose_totals[vertex] += weight
+        vertices = [tuple(value / pose_totals[index] for value in coordinates[index])
+                    if pose_totals[index] > 0 else vertex
+                    for index, vertex in enumerate(mesh.vertices)]
+        mesh = replace(mesh, vertices=vertices,
+                       normals=_mesh_vertex_normals(vertices, mesh.faces))
     names = tuple(target_bone_metadata.get(bone.index, (f"bone_{bone.index}", None, 0))[0]
                   for bone in target_bones)
+    note = "GLB weights mapped"
+    if len(mapped) > len(pairs):
+        note += f"; {len(mapped) - len(pairs)} extra joints folded into parents"
+    if discarded_faces:
+        note += f"; {discarded_faces} remote triangles omitted"
+    if rest_pose_converted:
+        note += "; rest pose converted"
     return replace(mesh, skin_bones=adapted, skin_flags=target.skin_flags,
-                   source_joint_names=names)
+                   source_joint_names=names, skin_adaptation_note=note)
 
 
 def _mesh_vertex_normals(vertices, faces):

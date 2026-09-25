@@ -27,7 +27,7 @@ from ..mesh_import import (
     _mesh_rli_replacements,
 )
 from ..mesh_uv import _jade_uv_to_standard
-from ..mesh_material_import import import_mesh_materials
+from ..mesh_material_import import import_mesh_materials, material_source_aliases
 from ..material_stream import insert_material_resources, validate_material_resources
 from ..mesh_collision import recalculate_mesh_collision, insert_collision_resources
 from ..mesh_export import _mesh_obj_lines, _write_skinned_glb, _character_bone_metadata
@@ -639,7 +639,14 @@ class MeshEditorMixin:
             entry = entries[target.entry_index]
             if entry.key != target.key:
                 raise ValueError("The selection no longer matches the asset: rescan it.")
+            adapt_skin = (self._mesh_adapt_bones_and_weights.get()
+                          and not self._mesh_maintain_original_skin.get())
+            if adapt_skin and self._mesh_fit_target.get():
+                raise ValueError("Fit size and center cannot be combined with Adapt bones and weights: scaling the mesh without its bind pose breaks character animation.")
             candidate = jade_mesh.fitted_mesh(self._swap_mesh, target) if self._mesh_fit_target.get() else self._swap_mesh
+            if adapt_skin:
+                candidate = _adapt_mesh_skin_to_target(
+                    candidate, target, _character_bone_metadata(data, target, require_names=True))
             updates = {}
             additions = []
             materials_replaced = False
@@ -655,10 +662,12 @@ class MeshEditorMixin:
                 native_count = len(native_keys)
                 editable_count = len({key for key in native_keys
                                       if key in editable and editable[key].texture_offset is not None})
-                source_count = len({slot for slot, count in candidate.material_ids if count > 0})
+                source_count = len(set(material_source_aliases(
+                    candidate, self._swap_mesh_material_textures,
+                    self._swap_mesh_material_colors).values()))
                 add_excess = (source_count > editable_count and messagebox.askyesno(
                     "Add excess materials",
-                    f"The imported mesh has {source_count} materials; this BF pack has "
+                    f"The imported mesh has {source_count} distinct material appearances; this BF pack has "
                     f"{native_count} slots ({editable_count} editable).\n\n"
                     "Add excess materials?",
                     parent=self))
@@ -675,11 +684,6 @@ class MeshEditorMixin:
                 candidate, alignment_target,
                 prefer_native_slots=("OBJ" in self._swap_mesh.layout_name
                                      or materials_replaced))
-            adapt_skin = (self._mesh_adapt_bones_and_weights.get()
-                          and not self._mesh_maintain_original_skin.get())
-            if adapt_skin:
-                candidate = _adapt_mesh_skin_to_target(
-                    candidate, target, _character_bone_metadata(data, target, require_names=True))
             vertex_tint, color_intensity = self._mesh_vertex_color_settings()
             updates.update(_mesh_rli_replacements(
                 data, target, candidate, vertex_tint, color_intensity))
@@ -701,7 +705,7 @@ class MeshEditorMixin:
             patched = insert_collision_resources(patched, collision_additions)
             meshes = _scan_pop_meshes(patched)
             updated = next((m for m in meshes if m.key == target.key), None)
-            if updated is None or len(updated.faces) != len(self._swap_mesh.faces):
+            if updated is None or len(updated.faces) != len(candidate.faces):
                 raise ValueError("Rebuilt mesh verification failed.")
             _associate_mesh_material_packs(patched, meshes)
             images, texture_maps, color_maps, material_keys, _ = self._collect_mesh_render_resources(asset, patched, meshes)
@@ -735,7 +739,7 @@ class MeshEditorMixin:
             self.status.set("Mesh applied in memory. Save the BF/BIN/DEC to write it to disk.")
             self.mesh_source_label.config(text=f"{asset.name} - meshes applied in memory, ready to save")
             self._log(f"APPLY Mesh 0x{target.key:08X}: {len(updated.vertices)} vertices, {len(updated.faces)} faces; "
-                      f"{len(updated.skin_bones or [])} bones, skin source: {'BF target' if self._mesh_maintain_original_skin.get() else 'adapted imported GLB' if adapt_skin else 'imported GLB'}; "
+                      f"{len(updated.skin_bones or [])} bones, skin source: {'BF target' if self._mesh_maintain_original_skin.get() else candidate.skin_adaptation_note if adapt_skin else 'imported GLB'}; "
                       f"vertex color {self._mesh_vertex_color.get().upper()} at {color_intensity * 100:.0f}%")
             return True
         except Exception as exc:
