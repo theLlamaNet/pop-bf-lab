@@ -5,9 +5,10 @@ import math
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk
+from tkinter import ttk, filedialog, messagebox
 
 from .level_scene import LevelObject, object_basis
+from .level_export import export_level_scene
 from .viewports import GL, GLU, MeshViewport, OpenGLFrame
 
 
@@ -543,6 +544,11 @@ class LevelWorkspace(tk.Toplevel):
         self.minsize(850, 550)
         self.configure(bg=parent._dark["bg"])
         self.objects = objects
+        self.meshes = meshes
+        self.mesh_links = mesh_links
+        self.texture_maps = texture_maps
+        self.textures = textures
+        self.scene_name = title
         self.on_change = on_change
         self.on_open_mesh = on_open_mesh
         self.selected = None
@@ -586,6 +592,7 @@ class LevelWorkspace(tk.Toplevel):
         self.wireframe_button = ttk.Button(display_row, text="Wireframe: Off", command=self.toggle_wireframe)
         self.wireframe_button.pack(side="left", padx=2)
         ttk.Label(inspector, text="Scene objects", font=("Segoe UI Semibold", 11)).pack(anchor="w")
+        ttk.Button(inspector, text="Export scene as...", command=self.export_scene).pack(fill="x", pady=(7, 0))
         tree_frame = ttk.Frame(inspector)
         tree_frame.pack(fill="both", expand=True, pady=(8, 8))
         self._tree_frame = tree_frame
@@ -643,6 +650,54 @@ class LevelWorkspace(tk.Toplevel):
                 field.bind("<FocusOut>", self._commit_fields)
                 self.fields[(group, axis)] = var
         ttk.Label(inspector, text="Click a mesh, trigger, or light to select it; drag a colored gizmo handle to transform it.\nDouble-click an object to focus and orbit it.\nW/S: forward/back  •  A/D: strafe\nArrows: move up/down/left/right\nLeft drag: orbit  •  Right drag: pan  •  Wheel: zoom", wraplength=230).pack(anchor="w", pady=12)
+
+    def export_scene(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("Export scene as...")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+        fmt = tk.StringVar(value="obj")
+        ttk.Label(frame, text="Format").pack(anchor="w")
+        for value, label in (("obj", "OBJ + MTL"), ("glb", "GLB")):
+            ttk.Radiobutton(frame, text=label, variable=fmt, value=value).pack(anchor="w")
+        export_markers = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, text="Export lights and triggers", variable=export_markers).pack(anchor="w", pady=(10, 0))
+        ttk.Label(frame, text="Coordinate system").pack(anchor="w", pady=(12, 0))
+        axes = tk.StringVar(value="gltf")
+        for value, label in (("jade", "Jade Z-up"), ("gltf", "glTF Y-up")):
+            ttk.Radiobutton(frame, text=label, variable=axes, value=value).pack(anchor="w")
+        ttk.Label(frame, text="Destination folder").pack(anchor="w", pady=(12, 0))
+        folder = tk.StringVar()
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(3, 12))
+        ttk.Entry(row, textvariable=folder, width=46).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Browse...", command=lambda: folder.set(
+            filedialog.askdirectory(parent=dialog, title="Choose export folder") or folder.get())).pack(side="left", padx=(5, 0))
+
+        def submit():
+            destination = Path(folder.get())
+            if not folder.get() or not destination.is_dir():
+                messagebox.showerror("Export scene", "Choose an existing destination folder.", parent=dialog)
+                return
+            try:
+                path, count, texture_count = export_level_scene(
+                    destination, self.scene_name, fmt.get(), self.objects, self.meshes,
+                    self.mesh_links, self.textures, self.texture_maps,
+                    export_markers.get(), axes.get())
+            except Exception as exc:
+                messagebox.showerror("Export scene", str(exc), parent=dialog)
+                return
+            dialog.destroy()
+            messagebox.showinfo("Export scene", f"Exported {count} mesh instances and {texture_count} textures to:\n{path}", parent=self)
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
+        ttk.Button(buttons, text="Export", command=submit).pack(side="right", padx=(0, 8))
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
 
     def toggle_flashlight(self):
         if self.viewport is None:
