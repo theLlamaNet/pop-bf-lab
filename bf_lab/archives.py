@@ -432,6 +432,11 @@ def _patch_texture_key_in_asset(asset_data: bytes, texture_key: int, replacement
         if old_type not in (source_type, target_type):
             continue
         old_w, old_h = struct.unpack_from("<II", raw, 44)
+        valid_dimensions = {(width, height)}
+        if old_type == target_type:
+            valid_dimensions.add((target_width, target_height))
+        if (old_w, old_h) not in valid_dimensions:
+            continue
         pixel_start = 60 if old_type in (1, 5) else 56
         if old_type == 11 and struct.unpack_from("<I", raw, 36)[0] >= 4:
             pixel_start = 64
@@ -441,19 +446,41 @@ def _patch_texture_key_in_asset(asset_data: bytes, texture_key: int, replacement
                      11: (old_w*old_h+1)//2}.get(old_type, 0)
         stub = len(raw) - pixel_start < base_size
         header = bytearray(raw[:56])
-        # The first dimensions belong to TEX_tdst_File_Params. Preserve them
-        # as TextureUpscale.cpp does; the cooked surface has its own dimensions.
+        # TEX_tdst_File_Params carries the dimensions used by Jade when it
+        # loads the texture. Keep them in sync with the cooked surface: leaving
+        # the original size here makes resized replacements unsafe in-game.
+        struct.pack_into("<HH", header, 12, target_width, target_height)
         struct.pack_into("<III", header, 40, target_type, target_width, target_height)
         mip_count = 0
         if target_type in (5, 6, 7):
-            mip_count = _infer_mip_count(target_width, target_height, len(replacement_payload),
+            payload_size = len(replacement_payload)
+            if target_type == 5:
+                try:
+                    _infer_mip_count(target_width, target_height, payload_size, 8)
+                except ValueError:
+                    # Jade BC1 records may carry a DWORD after the blocks.
+                    _infer_mip_count(target_width, target_height, payload_size - 4, 8)
+                    payload_size -= 4
+            mip_count = _infer_mip_count(target_width, target_height, payload_size,
                                          8 if target_type == 5 else 16) - 1
         struct.pack_into("<I", header, 52, mip_count)
         if stub:
-            replacement_entry = bytes(header) + bytes(max(0, len(raw)-56))
+            # A placeholder has no pixels. Its small PAL8/BC1 prefix belongs
+            # to the old format; copying it into a BC3 record makes a bogus
+            # texture visible to the scanner and may confuse the game loader.
+            replacement_entry = bytes(header) + (bytes(4) if target_type in (1, 5) else b"")
         else:
             prefix = bytes(4) if target_type in (1, 5) else b""
-            replacement_entry = bytes(header) + prefix + replacement_payload
+            pixels = replacement_payload
+            if target_type == 5 and len(replacement_payload) == payload_size:
+                old_pixels = raw[pixel_start:]
+                try:
+                    _infer_mip_count(old_w, old_h, len(old_pixels) - 4, 8)
+                except ValueError:
+                    pass
+                else:
+                    pixels += old_pixels[-4:]
+            replacement_entry = bytes(header) + prefix + pixels
         struct.pack_into("<I", data, resource.offset, len(replacement_entry))
         data[resource.data_offset:resource.data_offset + resource.size] = replacement_entry
         matches += 1

@@ -47,6 +47,12 @@ def _scan_pop_textures(data: bytes) -> list[TextureInfo]:
         stored_w, stored_h = (actual_w, actual_h) if 1 <= actual_w <= 8192 and 1 <= actual_h <= 8192 else (width, height)
         payload_size = data_end - data_offset
         blocks = max(1, (stored_w + 3) // 4) * max(1, (stored_h + 3) // 4)
+        minimum_size = {0: stored_w * stored_h * 3,
+                        1: stored_w * stored_h,
+                        5: blocks * 8, 6: blocks * 16, 7: blocks * 16,
+                        11: (stored_w * stored_h + 1) // 2}[texture_type]
+        if payload_size < minimum_size:
+            continue  # Jade texture header/stub, not a viewable image.
         if texture_type == 7:
             fmt = "Raw BGRA8 (reference)" if payload_size == 4 else ("Raw BGRA8" if payload_size == stored_w * stored_h * 4 else "DXT5")
         elif texture_type == 6:
@@ -368,46 +374,60 @@ def _encode_dxt1_block(pixels: list[tuple[int, int, int, int]]) -> bytes:
     colors = [(pixel[0], pixel[1], pixel[2]) for pixel in opaque]
     min_rgb = tuple(min(color[i] for color in colors) for i in range(3))
     max_rgb = tuple(max(color[i] for color in colors) for i in range(3))
-    c0, c1 = _rgb565(max_rgb), _rgb565(min_rgb)
     has_transparency = any(transparent)
-    if has_transparency:
-        # BC1's three-colour mode (c0 <= c1) reserves index 3 for alpha 0.
-        if c0 > c1:
-            c0, c1 = c1, c0
-    else:
-        # Four-colour mode needs c0 > c1. Avoid accidentally selecting the
-        # transparent BC1 mode for a flat, fully opaque block.
-        if c0 <= c1:
-            c0 = min(0xFFFF, c1 + 1)
-            if c0 <= c1:
-                c1 = max(0, c0 - 1)
+    weights = (1.0, 0.0, 0.5) if has_transparency else (1.0, 0.0, 2 / 3, 1 / 3)
 
-    rgb0, rgb1 = _unpack565(c0), _unpack565(c1)
-    if has_transparency:
-        palette = [
-            rgb0,
-            rgb1,
-            tuple((rgb0[i] + rgb1[i]) // 2 for i in range(3)),
-        ]
-    else:
-        palette = [
-            rgb0,
-            rgb1,
-            tuple((2 * rgb0[i] + rgb1[i]) // 3 for i in range(3)),
-            tuple((rgb0[i] + 2 * rgb1[i]) // 3 for i in range(3)),
-        ]
-
-    indices = 0
-    for i, pixel in enumerate(pixels):
-        if transparent[i]:
-            index = 3
+    def evaluate(c0: int, c1: int):
+        if has_transparency:
+            c0, c1 = min(c0, c1), max(c0, c1)
         else:
-            color = pixel[:3]
-            index = min(
-                range(len(palette)),
-                key=lambda n: sum((color[channel] - palette[n][channel]) ** 2 for channel in range(3)),
-            )
-        indices |= index << (2 * i)
+            c0, c1 = max(c0, c1), min(c0, c1)
+            if c0 == c1:
+                c0, c1 = (c0 + 1, c1) if c0 < 0xffff else (c0, c1 - 1)
+        rgb0, rgb1 = _unpack565(c0), _unpack565(c1)
+        palette = [tuple(round(w * rgb0[j] + (1 - w) * rgb1[j]) for j in range(3))
+                   for w in weights]
+        indices = 0
+        error = 0
+        assignments = []
+        for i, pixel in enumerate(pixels):
+            if transparent[i]:
+                index = 3
+            else:
+                index = min(range(len(weights)), key=lambda n:
+                            sum((pixel[j] - palette[n][j]) ** 2 for j in range(3)))
+                error += sum((pixel[j] - palette[index][j]) ** 2 for j in range(3))
+                assignments.append((pixel[:3], weights[index]))
+            indices |= index << (2 * i)
+        return error, c0, c1, indices, assignments
+
+    # Min/max endpoints can miss diagonal colour gradients. Try the pair with
+    # the largest RGB separation, then fit endpoint colours to the selected
+    # BC1 indices. Quantization is evaluated after each step.
+    far_a, far_b = max(((a, b) for a in colors for b in colors),
+                       key=lambda pair: sum((pair[0][j] - pair[1][j]) ** 2 for j in range(3)))
+    best = min((evaluate(_rgb565(max_rgb), _rgb565(min_rgb)),
+                evaluate(_rgb565(far_a), _rgb565(far_b))), key=lambda candidate: candidate[0])
+    for _ in range(3):
+        samples = best[4]
+        aa = sum(w * w for _, w in samples)
+        ab = sum(w * (1 - w) for _, w in samples)
+        bb = sum((1 - w) ** 2 for _, w in samples)
+        determinant = aa * bb - ab * ab
+        if determinant < 1e-8:
+            break
+        endpoint0 = []
+        endpoint1 = []
+        for channel in range(3):
+            ap = sum(w * rgb[channel] for rgb, w in samples)
+            bp = sum((1 - w) * rgb[channel] for rgb, w in samples)
+            endpoint0.append(max(0, min(255, round((ap * bb - bp * ab) / determinant))))
+            endpoint1.append(max(0, min(255, round((bp * aa - ap * ab) / determinant))))
+        candidate = evaluate(_rgb565(tuple(endpoint0)), _rgb565(tuple(endpoint1)))
+        if candidate[0] >= best[0]:
+            break
+        best = candidate
+    _, c0, c1, indices, _ = best
     return c0.to_bytes(2, "little") + c1.to_bytes(2, "little") + indices.to_bytes(4, "little")
 
 
@@ -431,13 +451,31 @@ def _encode_dxt1(image, mip_count: int = 1) -> bytes:
 
 
 def _dxt1_payload_from_file(path: Path, texture: TextureInfo) -> bytes:
-    """Encode a replacement as POP DXT1 (type 5), as Jade Toolkit does.
+    """Import a DXT1 bitstream unchanged, or encode a raster image as BC1.
 
-    Jade's writer emits one DXT1 base level and clears the texture mip field.
-    Keeping format 5 is essential: changing a game DXT1 texture to type 7
-    changes the entry layout and can make the renderer read wrong bytes.
+    Recompressing an already valid DDS adds BC1 quantization artifacts, which
+    are particularly visible around a skybox pole.
     """
+    compatible = _compatible_dds_payload(path, texture.width, texture.height, b"DXT1", 8)
+    if compatible is not None:
+        return compatible
     return _encode_dxt1(_image_rgba(path, texture.width, texture.height))
+
+
+def _compatible_dds_payload(path: Path, width: int, height: int,
+                            fourcc: bytes, bytes_per_block: int) -> bytes | None:
+    """Return a validated DDS block stream without decoding or recompression."""
+    with path.open("rb") as stream:
+        header = stream.read(128)
+        if header[:4] != b"DDS ":
+            return None
+        payload = stream.read()
+    if (len(header) != 128 or struct.unpack_from("<I", header, 4)[0] != 124
+            or header[84:88] != fourcc
+            or struct.unpack_from("<II", header, 12) != (height, width)):
+        return None
+    _infer_mip_count(width, height, len(payload), bytes_per_block)
+    return payload
 
 
 def _build_tga_header(width: int, height: int, pixel_depth: int = 32) -> bytes:
@@ -637,14 +675,18 @@ def _texture_replacement_from_file(path: Path, texture: TextureInfo, original: b
     if target_type in (5, 7) and (width % 4 or height % 4):
         raise ValueError("Jade DXT textures require dimensions divisible by 4.")
     if (width, height) != (texture.width, texture.height):
-        image = _image_rgba(path, width, height)
-        # A changed surface gets a new base level; old mips/padding describe
-        # the old dimensions and cannot be appended to the resized texture.
+        # A changed surface cannot reuse the original mip chain. Preserve a
+        # matching DDS chain verbatim, or encode a new base level from pixels.
         if target_type == 5:
-            payload = _encode_dxt1(image)
+            payload = _compatible_dds_payload(path, width, height, b"DXT1", 8)
+            if payload is None:
+                payload = _encode_dxt1(_image_rgba(path, width, height))
         elif target_type == 7:
-            payload = _encode_dxt5(image, 1)
+            payload = _compatible_dds_payload(path, width, height, b"DXT5", 16)
+            if payload is None:
+                payload = _encode_dxt5(_image_rgba(path, width, height), 1)
         else:
+            image = _image_rgba(path, width, height)
             is_bgr24 = texture.data_end - texture.data_offset == texture.width * texture.height * 3
             payload = image.convert("RGB").tobytes("raw", "BGR") if is_bgr24 else image.tobytes("raw", "BGRA")
     elif texture.texture_type == 7:

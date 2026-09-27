@@ -79,6 +79,7 @@ class AssetBrowserMixin:
         try:
             self._log(f"INFO  Parsing BF: {path}")
             self.project.open_bf(Path(path))
+            self._clear_animation_editor()
             self.refresh_assets()
             self._refresh_title()
             self._refresh_bf_repack_info()
@@ -97,6 +98,7 @@ class AssetBrowserMixin:
             bin_path = Path(path)
             raw = bin_path.read_bytes()
             self.project.open_bin(bin_path)
+            self._clear_animation_editor()
             self.refresh_assets()
             self._refresh_title()
             state = "POP-LZO decompressed" if self.project.direct_compressed else "uncompressed"
@@ -117,6 +119,7 @@ class AssetBrowserMixin:
         try:
             dec_path = Path(path)
             self.project.open_dec(dec_path)
+            self._clear_animation_editor()
             self._ova_data = bytearray(dec_path.read_bytes())
             self._ova_original = bytes(self._ova_data)
             self._ova_dirty = False
@@ -132,6 +135,7 @@ class AssetBrowserMixin:
             messagebox.showerror("Import DEC", str(exc))
 
     def close_project(self) -> None:
+        self._clear_animation_editor()
         self.project = JadeProject()
         self.refresh_assets()
         self._refresh_title()

@@ -38,6 +38,9 @@ if OpenGLFrame is not None:
             self.distance = 3.2
             self.target = [0.0, 0.0, 0.0]
             self.drag = None
+            self.rig_visible = False
+            self.rig_segments = []
+            self.rig_points = []
             self.bind("<ButtonPress-1>", self._down)
             self.bind("<B1-Motion>", self._orbit)
             self.bind("<ButtonPress-3>", self._pan_down)
@@ -103,6 +106,26 @@ if OpenGLFrame is not None:
             self.vertex_tint = tuple(max(0.0, min(1.0, float(value))) for value in tint)
             self.vertex_color_intensity = max(0.0, min(2.0, float(intensity)))
             if self.winfo_ismapped():
+                self._display()
+
+        def update_vertices(self, vertices):
+            """Update a posed mesh without resetting orbit, zoom or GPU textures."""
+            if self.mesh is None:
+                return
+            from dataclasses import replace
+            self.mesh = replace(self.mesh, vertices=vertices)
+            if self.winfo_ismapped():
+                self._display()
+
+        def set_rig_visible(self, visible):
+            self.rig_visible = bool(visible)
+            if self.winfo_ismapped():
+                self._display()
+
+        def set_rig_segments(self, segments, points):
+            self.rig_segments = segments
+            self.rig_points = points
+            if self.rig_visible and self.winfo_ismapped():
                 self._display()
 
         def _release_textures(self):
@@ -189,7 +212,7 @@ if OpenGLFrame is not None:
             GLU.gluLookAt(0.0, 0.0, self.distance, self.target[0], self.target[1], self.target[2], 0.0, 1.0, 0.0)
             GL.glRotatef(math.degrees(self.pitch), 1, 0, 0)
             GL.glRotatef(math.degrees(self.yaw), 0, 1, 0)
-            if self.mesh:
+            if self.mesh and not self.rig_visible:
                 GL.glPushMatrix()
                 GL.glTranslatef(-self.target[0], -self.target[1], -self.target[2])
                 self._draw_mesh(
@@ -201,6 +224,26 @@ if OpenGLFrame is not None:
                                     self.mesh.second_uvs or [], self.mesh.second_uv_indices or [],
                                     self.mesh.second_material_ids or self.mesh.material_ids, None)
                 GL.glPopMatrix()
+            elif self.rig_visible and self.rig_points:
+                GL.glDisable(GL.GL_LIGHTING)
+                GL.glDisable(GL.GL_TEXTURE_2D)
+                GL.glPushMatrix()
+                GL.glTranslatef(-self.target[0], -self.target[1], -self.target[2])
+                GL.glLineWidth(3.0)
+                GL.glColor3f(0.35, 0.75, 1.0)
+                GL.glBegin(GL.GL_LINES)
+                for start, end in self.rig_segments:
+                    GL.glVertex3f(*start)
+                    GL.glVertex3f(*end)
+                GL.glEnd()
+                GL.glPointSize(7.0)
+                GL.glColor3f(1.0, 0.7, 0.25)
+                GL.glBegin(GL.GL_POINTS)
+                for point in self.rig_points:
+                    GL.glVertex3f(*point)
+                GL.glEnd()
+                GL.glPopMatrix()
+                GL.glEnable(GL.GL_LIGHTING)
             GL.glDisable(GL.GL_TEXTURE_2D)
             GL.glColor3f(0.22, 0.25, 0.30)
             GL.glBegin(GL.GL_LINES)

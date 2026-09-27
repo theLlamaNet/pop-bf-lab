@@ -460,8 +460,9 @@ class TextureEditorMixin:
         new_tex = next((item for item in self._texture_infos
                         if item.key == tex.key and item.texture_type == target_type
                         and item.width == width and item.height == height), None)
+        self._clear_tree(self.texture_tree)
         for item in self._texture_infos:
-            self.texture_tree.item(f"tex_{item.index}", values=(
+            self.texture_tree.insert("", "end", iid=f"tex_{item.index}", values=(
                 f"Texture #{item.index + 1} 0x{item.key:08X}",
                 f"{item.data_end - item.data_offset:,} B", item.format, f"{item.width} x {item.height}",
             ))

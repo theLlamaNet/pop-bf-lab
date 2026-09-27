@@ -23,9 +23,10 @@ from .level import LevelEditorMixin
 from .ova import OvaEditorMixin
 from .repack import RepackMixin
 from .texture import TextureEditorMixin
+from .animation import AnimationEditorMixin
 
 
-class JadeToolkit(AssetBrowserMixin, RepackMixin, OvaEditorMixin, LevelEditorMixin, MeshEditorMixin, MaterialEditorMixin, TextureEditorMixin, tk.Tk):
+class JadeToolkit(AssetBrowserMixin, RepackMixin, OvaEditorMixin, LevelEditorMixin, MeshEditorMixin, MaterialEditorMixin, TextureEditorMixin, AnimationEditorMixin, tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("PoP BF Lab")
@@ -240,6 +241,7 @@ class JadeToolkit(AssetBrowserMixin, RepackMixin, OvaEditorMixin, LevelEditorMix
         self.level_tab = ttk.Frame(self.tabs, padding=8)
         self.mesh_tab = ttk.Frame(self.tabs, padding=8)
         self.texture_tab = ttk.Frame(self.tabs, padding=8)
+        self.animation_tab = ttk.Frame(self.tabs, padding=8)
         self.material_tab = ttk.Frame(self.tabs, padding=8)
         self.bf_repack_tab = ttk.Frame(self.tabs, padding=8)
         self.tabs.add(self.asset_tab, text="Asset Browser")
@@ -249,6 +251,7 @@ class JadeToolkit(AssetBrowserMixin, RepackMixin, OvaEditorMixin, LevelEditorMix
         self.tabs.add(self.mesh_tab, text="Mesh Editor")
         self.tabs.add(self.material_tab, text="Material Editor")
         self.tabs.add(self.texture_tab, text="Texture Editor")
+        self.tabs.add(self.animation_tab, text="Animations Editor")
         self._build_asset_tab()
         self._build_bf_repack_tab()
         self._build_ova_tab()
@@ -256,6 +259,7 @@ class JadeToolkit(AssetBrowserMixin, RepackMixin, OvaEditorMixin, LevelEditorMix
         self._build_mesh_tab()
         self._build_material_tab()
         self._build_texture_tab()
+        self._build_animation_tab()
 
         self.status = tk.StringVar(value="Ready")
         ttk.Label(root, textvariable=self.status, relief="sunken", anchor="w").pack(fill="x", pady=(8, 0))
