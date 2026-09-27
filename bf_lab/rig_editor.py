@@ -26,6 +26,23 @@ def _segment_hit(px, py, start, end):
     return math.hypot(px - start[0] - t * dx, py - start[1] - t * dy), t
 
 
+def _attach_cloth_to_mapped_ancestors(mapping, parents, parts):
+    """Suggest existing BF slots from the imported joint hierarchy."""
+    result = dict(mapping)
+    for slot, part in parts.items():
+        if part != 'Cloth part' or result.get(slot) is not None:
+            continue
+        parent = parents.get(slot)
+        seen = {slot}
+        while parent is not None and parent not in seen:
+            seen.add(parent)
+            if result.get(parent) is not None:
+                result[slot] = result[parent]
+                break
+            parent = parents.get(parent)
+    return result
+
+
 if OpenGLFrame is not None:
     class RigViewport(MeshViewport):
         def __init__(self, master, owner, **kwargs):
@@ -59,6 +76,18 @@ if OpenGLFrame is not None:
 
         def _gizmo_length(self):
             return max(0.01, self.distance * 0.13)
+
+        def focus_bone(self, slot):
+            """Orbit around a joint, using its connected bones for framing."""
+            position = self.positions[slot]
+            linked = [other for index, other in self.positions.items()
+                      if self.parents.get(index) == slot or self.parents.get(slot) == index]
+            radius = max((math.dist(position, other) for other in linked), default=0.0)
+            if radius <= 0:
+                radius = max(0.1, self.distance * 0.1)
+            self.target = list(position)
+            self.distance = max(0.25, radius * 2.7)
+            self._display()
 
         def _rig_mouse_down(self, event):
             self._rig_drag = None
@@ -175,7 +204,11 @@ class RigEditor(tk.Toplevel):
         self.geometry('1180x760')
         self.transient(parent)
         self.source, self.target, self.metadata, self.mode = source, target, metadata, mode
+        from .mesh_import import _discard_remote_skin_triangles
+        self.scene_source = _discard_remote_skin_triangles(source, target)
         self.result = None
+        self._previewing_result = False
+        self._preview_camera = None
         self.bones = target.skin_bones if mode == 'Keep original rig' else source.skin_bones
         if not self.bones:
             raise ValueError('Rig Editor requires a skinned GLB and a skinned BF target.')
@@ -187,11 +220,13 @@ class RigEditor(tk.Toplevel):
         targets = {bone.index: metadata.get(bone.index, (f'bone_{bone.index}',))[0]
                    for bone in target.skin_bones or []}
         self.target_labels = {f'{slot}: {name}': slot for slot, name in targets.items()}
+        self.target_labels['Spatial weight recovery'] = -1
         source_names = source.source_bone_names or {}
         for bone in self.bones:
             name = source_names.get(bone.index, '').casefold()
             matches = [slot for slot, target_name in targets.items() if name and name == target_name.casefold()]
-            self.mapping[bone.index] = matches[0] if len(matches) == 1 else None
+            self.mapping[bone.index] = (matches[0] if len(matches) == 1 else
+                                        -1 if name in ('neutral_bone', 'neutral', 'helper') else None)
             if any(token in (source_names.get(bone.index, '') or targets.get(bone.index, '')).casefold()
                    for token in ('cape', 'cloth', 'scarf', 'skirt', 'hair', 'belt', 'mantle')):
                 self.parts[bone.index] = 'Cloth part'
@@ -210,7 +245,7 @@ class RigEditor(tk.Toplevel):
         if OpenGLFrame is not None:
             self.viewport = RigViewport(left, self, highlightthickness=0, bd=0)
             self.viewport.pack(fill='both', expand=True)
-            self.viewport.set_scene(self.source, {})
+            self.viewport.set_scene(self.scene_source, {})
             self.viewport.bones = self.bones
             self.viewport.positions = self.positions
             self.viewport.parents = self.parents
@@ -231,6 +266,7 @@ class RigEditor(tk.Toplevel):
             self.tree.insert('', 'end', iid=str(bone.index), text=f'{bone.index}: {name}',
                              values=(self.parts[bone.index], self.mapping.get(bone.index)))
         self.tree.bind('<<TreeviewSelect>>', self._select)
+        self.tree.bind('<Double-1>', self._focus_tree_bone)
         edit = ttk.LabelFrame(right, text='Selected joint', padding=8)
         edit.pack(fill='x', pady=8)
         self.xyz = [tk.StringVar() for _ in range(3)]
@@ -249,6 +285,13 @@ class RigEditor(tk.Toplevel):
             ttk.Combobox(edit, textvariable=self.destination, state='readonly',
                          values=['Unassigned', *self.target_labels]).pack(fill='x', pady=3)
             self.destination.trace_add('write', self._set_destination)
+            ttk.Button(edit, text='Attach unassigned cloth to parent',
+                       command=self._attach_cloth).pack(fill='x', pady=(8, 0))
+            ttk.Button(edit, text='Match cloth to BF cloth bones',
+                       command=self._match_cloth_bones).pack(fill='x', pady=(3, 0))
+            self._preview_button = ttk.Button(edit, text='Preview mapped result',
+                                              command=self._toggle_result_preview)
+            self._preview_button.pack(fill='x', pady=(3, 0))
         ttk.Button(self, text='Apply rig', command=self._accept).pack(side='right', padx=10, pady=8)
         ttk.Button(self, text='Cancel', command=self.destroy).pack(side='right', pady=8)
         self.tree.selection_set(str(self.bones[0].index))
@@ -257,6 +300,16 @@ class RigEditor(tk.Toplevel):
     def _selected(self):
         selection = self.tree.selection()
         return int(selection[0]) if selection else None
+
+    def _focus_tree_bone(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid or self.viewport is None:
+            return
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        self._select()
+        self.viewport.focus_bone(int(iid))
+        self.viewport.focus_set()
 
     def _select(self, _event=None):
         slot = self._selected()
@@ -291,12 +344,87 @@ class RigEditor(tk.Toplevel):
         slot = self._selected()
         if slot is not None:
             self.mapping[slot] = self.target_labels.get(self.destination.get())
-            self.tree.set(str(slot), 'target', self.mapping[slot] or 'Unassigned')
+            self.tree.set(str(slot), 'target',
+                          'Spatial weight recovery' if self.mapping[slot] == -1 else
+                          self.mapping[slot] if self.mapping[slot] is not None else 'Unassigned')
+
+    def _attach_cloth(self):
+        proposed = _attach_cloth_to_mapped_ancestors(self.mapping, self.parents, self.parts)
+        changed = [slot for slot in proposed if proposed[slot] != self.mapping.get(slot)]
+        self.mapping = proposed
+        for slot in changed:
+            self.tree.set(str(slot), 'target', proposed[slot])
+        self._select()
+        remaining = sum(self.parts[slot] == 'Cloth part' and self.mapping.get(slot) is None
+                        for slot in self.parts)
+        messagebox.showinfo('Rig Editor',
+                            f'{len(changed)} cloth joint(s) attached to an assigned ancestor. '
+                            f'{remaining} still need a manual BF target. '
+                            'These joints will follow the parent; independent cloth motion '
+                            'requires a compatible animated BF bone.', parent=self)
+
+    def _match_cloth_bones(self):
+        targets = {bone.index: bone for bone in self.target.skin_bones or []
+                   if any(token in self.metadata.get(bone.index, ('',))[0].casefold()
+                          for token in ('skirt', 'hair', 'cloth', 'cape', 'scarf', 'belt'))}
+        used = {slot for slot in self.mapping.values() if slot is not None and slot >= 0}
+        changed = 0
+        for source in self.bones:
+            if self.parts[source.index] != 'Cloth part' or self.mapping[source.index] is not None:
+                continue
+            options = [bone for bone in targets.values() if bone.index not in used]
+            if not options:
+                break
+            origin = self.positions[source.index]
+            nearest = min(options, key=lambda bone: sum(
+                (a - b) ** 2 for a, b in zip(origin, _joint_position(bone))))
+            self.mapping[source.index] = nearest.index
+            self.tree.set(str(source.index), 'target', nearest.index)
+            used.add(nearest.index)
+            changed += 1
+        self._select()
+        messagebox.showinfo('Rig Editor',
+                            f'{changed} cloth joint(s) mapped to existing BF cloth slots. '
+                            'Inspect the skinned preview before applying.', parent=self)
+
+    def _toggle_result_preview(self):
+        if self.viewport is None:
+            return
+        if self._previewing_result:
+            self.viewport.set_scene(self.scene_source, {})
+            self.viewport.bones = self.bones
+            self.viewport.positions = self.positions
+            self.viewport.parents = self.parents
+            self.viewport.selected = self._selected()
+            self.viewport.target, self.viewport.distance, self.viewport.yaw, self.viewport.pitch = self._preview_camera
+            self._previewing_result = False
+            self._preview_button.configure(text='Preview mapped result')
+            self.viewport._display()
+            return
+        if any(value is None for value in self.mapping.values()):
+            messagebox.showerror('Rig Editor', 'Assign every imported joint before previewing.', parent=self)
+            return
+        try:
+            from .mesh_import import _adapt_mesh_skin_to_target
+            candidate = position_imported_skin(self.source, self.positions)
+            adapted = _adapt_mesh_skin_to_target(candidate, self.target, self.metadata,
+                                                 self.mapping, self.parts)
+        except Exception as exc:
+            messagebox.showerror('Rig Editor', str(exc), parent=self)
+            return
+        self._preview_camera = (list(self.viewport.target), self.viewport.distance,
+                                self.viewport.yaw, self.viewport.pitch)
+        self.viewport.set_scene(adapted, {})
+        self.viewport.bones = []
+        self.viewport.selected = None
+        self._previewing_result = True
+        self._preview_button.configure(text='Back to rig editing')
+        self.viewport._display()
 
     def _accept(self):
         self._set_position()
         if self.mode == 'Adapt new rig' and any(value is None for value in self.mapping.values()):
-            messagebox.showerror('Rig Editor', 'Assign every imported joint to a BF bone.', parent=self)
+            messagebox.showerror('Rig Editor', 'Assign each imported joint to a BF bone or spatial weight recovery.', parent=self)
             return
         self.result = (dict(self.positions), dict(self.mapping), dict(self.parts))
         self.destroy()

@@ -629,8 +629,13 @@ def _load_mesh_for_swap(path: Path, obj_axes: str = "Jade Z-up"):
 
 def _discard_remote_skin_triangles(mesh: MeshInfo, target: MeshInfo) -> MeshInfo:
     """Remove isolated corrupt triangles far outside the target character."""
-    bounds = [(min(v[axis] for v in target.vertices), max(v[axis] for v in target.vertices))
-              for axis in range(3)]
+    # An earlier import may itself contain a few remote helper triangles.
+    # Trim only the outer one percent before deriving the character scale.
+    bounds = []
+    for axis in range(3):
+        values = sorted(vertex[axis] for vertex in target.vertices)
+        trim = len(values) // 100 if len(values) >= 200 else 0
+        bounds.append((values[trim], values[-trim - 1]))
     extent = max(high - low for low, high in bounds)
     if extent <= 0:
         return mesh
@@ -665,7 +670,8 @@ def _discard_remote_skin_triangles(mesh: MeshInfo, target: MeshInfo) -> MeshInfo
 
 def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
                                target_bone_metadata: dict[int, tuple[str, int | None, int]],
-                               joint_map: dict[int, int] | None = None) -> MeshInfo:
+                               joint_map: dict[int, int] | None = None,
+                               source_parts: dict[int, str] | None = None) -> MeshInfo:
     """Map source joints to the animated target by key or name, never by order."""
     original_faces = len(mesh.faces)
     mesh = _discard_remote_skin_triangles(mesh, target)
@@ -692,6 +698,8 @@ def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
     for source in source_bones:
         if joint_map is not None:
             slot = joint_map.get(source.index)
+            if slot == -1:
+                continue
             if slot not in target_by_slot:
                 raise ValueError(f"Source joint {source.index} has no valid target bone assignment.")
             target_bone = target_by_slot[slot]
@@ -768,8 +776,44 @@ def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
                                for bone in target_bones))
     mapped = {source.index: destination for source, destination in pairs}
     source_for_pose = {source.index: source for source, _ in pairs}
+    # Extra cloth joints often map onto an existing body slot. Their own IBM
+    # describes the cape/hair joint, not the body's bind space: using it for
+    # rest-pose conversion teleports the cloth towards the body bone. Reuse
+    # the matching body's source IBM when available, otherwise leave that
+    # cloth geometry in its imported rest position.
+    preserve_rest = set()
+    anchored_cloth = set()
+    if joint_map is not None and source_parts:
+        by_target = {}
+        for source, destination in pairs:
+            by_target.setdefault(destination.index, []).append(source)
+        source_names = mesh.source_bone_names or {}
+        source_keys = mesh.source_bone_keys or {}
+        for source, destination in pairs:
+            if source_parts.get(source.index) != "Cloth part":
+                continue
+            target_info = target_bone_metadata.get(destination.index)
+            body_candidates = [bone for bone in by_target[destination.index]
+                               if source_parts.get(bone.index) != "Cloth part"]
+            anchor = None
+            if body_candidates:
+                def anchor_rank(bone):
+                    key_match = bool(target_info and source_keys.get(bone.index) == target_info[2])
+                    name_match = bool(target_info and source_names.get(bone.index, "").casefold()
+                                      == target_info[0].casefold())
+                    matrix_delta = sum((a - b) ** 2 for a, b in
+                                       zip(bone.matrix, destination.matrix))
+                    return (not key_match, not name_match, matrix_delta)
+                anchor = min(body_candidates, key=anchor_rank)
+            if anchor is None:
+                preserve_rest.add(source.index)
+            else:
+                source_for_pose[source.index] = anchor
+                anchored_cloth.add(source.index)
     for source in source_bones:
         if source.index in mapped:
+            continue
+        if joint_map is not None and joint_map.get(source.index) == -1:
             continue
         parent = (mesh.source_bone_parents or {}).get(source.index)
         seen = {source.index}
@@ -810,15 +854,46 @@ def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
                 weights.pop(vertex, None)
         for vertex in uncovered:
             totals[vertex] = 0.0
-        fallback = jade_mesh.transfer_skin(target_bones, target.vertices, mesh.vertices)
+        # Recover unassigned helper vertices from nearby *source* skin.  The
+        # target surface may not contain new cloth, so its nearest vertex can
+        # belong to an unrelated body part.
+        spatial_vertices = {vertex for bone in source_bones
+                            if joint_map is not None and joint_map.get(bone.index) == -1
+                            for vertex, _ in bone.weights}
+        donors = [index for index, total in enumerate(totals)
+                  if total > 0 and index not in uncovered]
+        material_for_vertex = [set() for _ in mesh.vertices]
+        face_index = 0
+        for material, count in mesh.material_ids:
+            for face in mesh.faces[face_index:face_index + count]:
+                for index in face:
+                    material_for_vertex[index].add(material)
+            face_index += count
+        donor_tree = jade_mesh.NearestPoints([mesh.vertices[index] for index in donors]) if donors else None
+        recovered = set()
+        if donor_tree:
+            for vertex in uncovered & spatial_vertices:
+                candidates = [index for index in donors if
+                              material_for_vertex[index] & material_for_vertex[vertex]]
+                if candidates:
+                    donor = min(candidates, key=lambda index: sum(
+                        (a - b) ** 2 for a, b in zip(mesh.vertices[vertex], mesh.vertices[index])))
+                else:
+                    donor = donors[donor_tree.nearest(mesh.vertices[vertex], 1)[0][1]]
+                for weights in weights_by_slot.values():
+                    if donor in weights:
+                        weights[vertex] = weights[donor]
+                        totals[vertex] += weights[donor]
+                recovered.add(vertex)
+        fallback = jade_mesh.transfer_skin(target_bones, target.vertices, mesh.vertices) if uncovered - recovered else []
         for bone in fallback:
             weights = weights_by_slot[bone.index]
             for vertex, word in bone.weights:
-                if vertex in uncovered:
+                if vertex in uncovered - recovered:
                     weights[vertex] = jade_mesh.decode_weight(word)
         for weights in weights_by_slot.values():
             for vertex, weight in weights.items():
-                if vertex in uncovered:
+                if vertex in uncovered - recovered:
                     totals[vertex] += weight
     if any(total <= 0 for total in totals):
         raise ValueError("Some imported vertices have no usable skin weights.")
@@ -827,7 +902,19 @@ def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
                                        if weight > 0]) for bone in target_bones]
     rest_pose_converted = any(max(abs(a - b) for a, b in zip(source_for_pose[source.index].matrix,
                                           mapped[source.index].matrix)) > 1e-4
-           for source in source_bones if source.index in mapped)
+           for source in source_bones if source.index in mapped and source.index not in preserve_rest)
+    if rest_pose_converted and len(pairs) >= 8:
+        from .mesh_export import _inverse_matrix
+        # Exporters can change bind-space orientation while preserving every
+        # joint centre and the already-aligned mesh.  Converting that case
+        # deforms the original rest geometry.
+        same_centres = all(max(abs(a - b) for a, b in zip(
+            _glb_transform_point(_inverse_matrix(source.matrix), (0., 0., 0.)),
+            _glb_transform_point(_inverse_matrix(destination.matrix), (0., 0., 0.)))) < 1e-4
+            for source, destination in pairs if source_parts is None or
+            source_parts.get(source.index) != 'Cloth part')
+        if same_centres:
+            rest_pose_converted = False
     if rest_pose_converted:
         # The GLB is in another armature's rest pose. Convert every influence
         # from its source bind space into the target bind space before writing
@@ -836,7 +923,10 @@ def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
         transforms = {source.index: _glb_mat_mul(
             _inverse_matrix(mapped[source.index].matrix),
             source_for_pose[source.index].matrix)
-            for source in source_bones if source.index in mapped}
+            for source in source_bones if source.index in mapped and source.index not in preserve_rest}
+        transforms.update({slot: (1., 0., 0., 0., 0., 1., 0., 0.,
+                                  0., 0., 1., 0., 0., 0., 0., 1.)
+                           for slot in preserve_rest})
         coordinates = [[0.0, 0.0, 0.0] for _ in mesh.vertices]
         pose_totals = [0.0] * len(mesh.vertices)
         for source in source_bones:
@@ -863,6 +953,12 @@ def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
         note += f"; {discarded_faces} remote triangles omitted"
     if rest_pose_converted:
         note += "; rest pose converted"
+    elif any(source.matrix != destination.matrix for source, destination in pairs):
+        note += "; matching joint centres preserved"
+    if preserve_rest:
+        note += f"; {len(preserve_rest)} cloth joint(s) kept in rest position"
+    if anchored_cloth:
+        note += f"; {len(anchored_cloth)} cloth joint(s) follow body rest pose"
     return replace(mesh, skin_bones=adapted, skin_flags=target.skin_flags,
                    source_joint_names=names, skin_adaptation_note=note)
 

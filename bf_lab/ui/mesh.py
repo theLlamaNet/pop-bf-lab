@@ -689,13 +689,24 @@ class MeshEditorMixin:
                 if (self._mesh_rig_session is None or
                         self._mesh_rig_session[:3] != (target.key, id(self._swap_mesh), mode)):
                     self._open_rig_editor(target)
-                positions, mapping, _parts = self._mesh_rig_session[3]
+                positions, mapping, parts = self._mesh_rig_session[3]
+                if (any(part == "Cloth part" for part in parts.values())
+                        and not self._mesh_import_materials.get()
+                        and len({slot for slot, _ in self._swap_mesh.material_ids})
+                            > len(target.material_ids)):
+                    raise ValueError(
+                        "The imported character adds cloth material groups, but the BF mesh has "
+                        "fewer material slots. Enable 'Import and replace materials' and add "
+                        "the excess slots so the cloth is not merged into an unrelated material.")
                 if keep_rig:
+                    from ..mesh_import import _discard_remote_skin_triangles
+                    candidate = _discard_remote_skin_triangles(candidate, target)
                     candidate = transfer_positioned_skin(candidate, target, positions)
                 else:
                     candidate = position_imported_skin(candidate, positions)
                     candidate = _adapt_mesh_skin_to_target(
-                        candidate, target, _character_bone_metadata(data, target, require_names=False), mapping)
+                        candidate, target, _character_bone_metadata(data, target, require_names=False),
+                        mapping, parts)
             elif target.skin_bones:
                 _require_identical_character_rig(
                     candidate, target, _character_bone_metadata(data, target, require_names=False))
@@ -726,6 +737,12 @@ class MeshEditorMixin:
                     f"{native_count} slots ({editable_count} editable).\n\n"
                     "Add excess materials?",
                     parent=self))
+                if (target.skin_bones and (adapt_skin or keep_rig)
+                        and any(part == "Cloth part" for part in parts.values())
+                        and source_count > editable_count and not add_excess):
+                    raise ValueError(
+                        "The added cloth needs its own material slot. Add the excess "
+                        "materials to keep it visible in game.")
                 candidate, updates, additions = import_mesh_materials(
                     data, target, candidate, self._swap_mesh_textures,
                     self._swap_mesh_material_textures, self._swap_mesh_material_colors, updates,
