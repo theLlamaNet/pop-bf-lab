@@ -664,7 +664,8 @@ def _discard_remote_skin_triangles(mesh: MeshInfo, target: MeshInfo) -> MeshInfo
 
 
 def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
-                               target_bone_metadata: dict[int, tuple[str, int | None, int]]) -> MeshInfo:
+                               target_bone_metadata: dict[int, tuple[str, int | None, int]],
+                               joint_map: dict[int, int] | None = None) -> MeshInfo:
     """Map source joints to the animated target by key or name, never by order."""
     original_faces = len(mesh.faces)
     mesh = _discard_remote_skin_triangles(mesh, target)
@@ -689,6 +690,14 @@ def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
             target_by_name.setdefault(info[0].casefold(), []).append(target_by_slot[index])
     pairs, claimed = [], set()
     for source in source_bones:
+        if joint_map is not None:
+            slot = joint_map.get(source.index)
+            if slot not in target_by_slot:
+                raise ValueError(f"Source joint {source.index} has no valid target bone assignment.")
+            target_bone = target_by_slot[slot]
+            claimed.add(target_bone.index)
+            pairs.append((source, target_bone))
+            continue
         target_bone = target_by_key.get((mesh.source_bone_keys or {}).get(source.index))
         if target_bone is None:
             name = (mesh.source_bone_names or {}).get(source.index, "").casefold()
@@ -717,7 +726,7 @@ def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
         pairs.append((source, target_bone))
     if not pairs:
         raise ValueError("No imported joints match the target GAO bone names or keys.")
-    if any(target_bone.index not in target_bone_metadata and
+    if joint_map is None and any(target_bone.index not in target_bone_metadata and
            source_bone.matrix != target_bone.matrix
            for source_bone, target_bone in pairs):
         raise ValueError("Cannot resolve the matched target bone names from the BF GAO gizmo table.")
@@ -725,7 +734,7 @@ def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
     # yet JOINTS/WEIGHTS describe different body parts at the same positions.
     # A large disagreement on coincident vertices is evidence that the GLB
     # weight table is unusable; recover the original character's weights.
-    if len(pairs) == len(source_bones) and all(
+    if joint_map is None and len(pairs) == len(source_bones) and all(
             max(abs(a - b) for a, b in zip(source.matrix, destination.matrix)) < 1e-4
             for source, destination in pairs):
         source_influences = [{} for _ in mesh.vertices]
@@ -856,6 +865,35 @@ def _adapt_mesh_skin_to_target(mesh: MeshInfo, target: MeshInfo,
         note += "; rest pose converted"
     return replace(mesh, skin_bones=adapted, skin_flags=target.skin_flags,
                    source_joint_names=names, skin_adaptation_note=note)
+
+
+def _require_identical_character_rig(mesh: MeshInfo, target: MeshInfo,
+                                     metadata: dict[int, tuple[str, int | None, int]]) -> None:
+    """Unassisted imports must use the exact animated BF joint identities and bind pose."""
+    source = {bone.index: bone for bone in mesh.skin_bones or []}
+    original = {bone.index: bone for bone in target.skin_bones or []}
+    if not source or source.keys() != original.keys() or len(source) != len(mesh.skin_bones or []):
+        raise ValueError("The imported character must have exactly the original bone slots. Use Rig Editor to adapt another rig.")
+    names = mesh.source_bone_names or {}
+    keys = mesh.source_bone_keys or {}
+    for slot, bone in source.items():
+        expected = original[slot]
+        if bone.matrix_type != expected.matrix_type or any(
+                abs(a - b) > 1e-4 for a, b in zip(bone.matrix, expected.matrix)):
+            raise ValueError(f"Bone {slot} has a different bind pose. Use Rig Editor.")
+        if slot in metadata:
+            name, parent, key = metadata[slot]
+            if keys.get(slot) != key and names.get(slot, "").casefold() != name.casefold():
+                raise ValueError(f"Bone {slot} does not match the original GAO joint '{name}'. Use Rig Editor.")
+            imported_parent = (mesh.source_bone_parents or {}).get(slot)
+            if imported_parent is not None and imported_parent != parent:
+                raise ValueError(f"Bone {slot} has a different parent. Use Rig Editor.")
+    if not any(bone.weights for bone in source.values()):
+        raise ValueError("The imported character has no skin weights.")
+    covered = {vertex for bone in source.values() for vertex, word in bone.weights
+               if jade_mesh.decode_weight(word) > 0}
+    if len(covered) != len(mesh.vertices):
+        raise ValueError("Some imported vertices have no skin weights. Paint them before importing.")
 
 
 def _mesh_vertex_normals(vertices, faces):
